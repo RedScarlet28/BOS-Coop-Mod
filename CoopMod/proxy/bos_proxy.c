@@ -31,7 +31,7 @@
 #include <ctype.h>
 #include <math.h>
 
-#define COOPMOD_VERSION "CoopMod proxy 0.77"
+#define COOPMOD_VERSION "CoopMod proxy 0.78"
 #define BOS_PREFERRED_BASE 0x10000000u
 
 static HMODULE g_self;
@@ -6578,24 +6578,40 @@ static const float g_diff_health[DIFF_N] = { 1.0f, 1.6f, 2.0f, 2.5f, 3.0f, 4.0f,
 typedef void (__fastcall *fn_char_damage)(BYTE *self, void *edx, void *out, DWORD a2, void *a3, DWORD a4, DWORD a5,
                                           DWORD a6, DWORD a7, DWORD a8, DWORD a9, DWORD a10, float a11);
 static fn_char_damage o_char_damage;
+typedef void *(__cdecl *fn_dmg_vp)(void);
+typedef BYTE *(__fastcall *fn_dmg_ent)(void *eng, void *edx, DWORD *id);
 static int is_human_character(BYTE *ch);
 static void __fastcall hook_char_damage(BYTE *self, void *edx, void *out, DWORD a2, void *a3, DWORD a4, DWORD a5,
                                         DWORD a6, DWORD a7, DWORD a8, DWORD a9, DWORD a10, float a11)
 {
     static volatile LONG logged, logged2;
-    if (g_difficulty > 0 && (a10 & 0xFF)) {
-        /* 0.77: an NPC hit a character: if it's a human, scale the whole hit by the difficulty here (the
-           NPCDamageMultiplier table is read when the level loads - a mid-mission /difficulty never reached it) */
-        int human = 0;
-        __try { human = is_human_character(self); } __except (EXCEPTION_EXECUTE_HANDLER) { human = 0; }
-        if (human) {
+    /* 0.78: a10 ("an NPC dealt the hit", Bos 0x10008DD0) is always 0 in a multiplayer game (engine vfunc
+       0x1C0 = solo), so neither the NPCDamageMultiplier table nor a10 can find NPC hits in co-op. a5 is the
+       attacker's entity id (0x10010BE0 / 0x10011020 pass *attacker): look it up with engine vfunc 0. */
+    int vic_human = 0;
+    if (g_difficulty > 0) __try { vic_human = is_human_character(self); } __except (EXCEPTION_EXECUTE_HANDLER) { vic_human = 0; }
+    if (g_difficulty > 0 && vic_human) {
+        BYTE *att = NULL;
+        int att_human = 1;
+        __try {
+            if (a5 != 0xFFFFFFFF && a5 != 0) {
+                void *eng;
+                ((fn_dmg_vp)VA(0x10093CD0))();
+                eng = ((fn_dmg_vp)VA(0x10093D00))();
+                if (eng) att = ((fn_dmg_ent)(*(void ***)eng)[0])(eng, NULL, &a5);   /* thiscall via fastcall */
+            }
+            att_human = att ? (att == self || is_human_character(att)) : 1;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { att = NULL; att_human = 1; }
+        if (!att_human) {
             float before = a11;
             a11 = a11 * g_diff_factor[g_difficulty];
-            if (InterlockedIncrement(&logged2) <= 5)
-                plog("[difficulty] NPC hit on player %s: damage scale %.2f -> %.2f (x%.1f)",
-                     entity_name(self), before, a11, g_diff_factor[g_difficulty]);
-        }
-    } else if (g_difficulty > 0 && !(a10 & 0xFF)) {
+            if (InterlockedIncrement(&logged2) <= 8)
+                plog("[difficulty] %s hit player %s: damage scale %.2f -> %.2f (x%.1f, shield/armor/health)",
+                     entity_name(att), entity_name(self), before, a11, g_diff_factor[g_difficulty]);
+        } else if (InterlockedIncrement(&logged2) <= 8)
+            plog("[difficulty] hit on player %s by %s (id %08X): not an NPC - unscaled", entity_name(self),
+                 att ? entity_name(att) : "?", a5);
+    } else if (g_difficulty > 0) {
         int human = 1;
         __try { human = is_human_character(self); } __except (EXCEPTION_EXECUTE_HANDLER) { human = 1; }
         if (!human) {
