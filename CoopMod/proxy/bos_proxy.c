@@ -31,7 +31,7 @@
 #include <ctype.h>
 #include <math.h>
 
-#define COOPMOD_VERSION "CoopMod proxy 0.76"
+#define COOPMOD_VERSION "CoopMod proxy 0.77"
 #define BOS_PREFERRED_BASE 0x10000000u
 
 static HMODULE g_self;
@@ -6582,8 +6582,20 @@ static int is_human_character(BYTE *ch);
 static void __fastcall hook_char_damage(BYTE *self, void *edx, void *out, DWORD a2, void *a3, DWORD a4, DWORD a5,
                                         DWORD a6, DWORD a7, DWORD a8, DWORD a9, DWORD a10, float a11)
 {
-    static volatile LONG logged;
-    if (g_difficulty > 0 && !(a10 & 0xFF)) {
+    static volatile LONG logged, logged2;
+    if (g_difficulty > 0 && (a10 & 0xFF)) {
+        /* 0.77: an NPC hit a character: if it's a human, scale the whole hit by the difficulty here (the
+           NPCDamageMultiplier table is read when the level loads - a mid-mission /difficulty never reached it) */
+        int human = 0;
+        __try { human = is_human_character(self); } __except (EXCEPTION_EXECUTE_HANDLER) { human = 0; }
+        if (human) {
+            float before = a11;
+            a11 = a11 * g_diff_factor[g_difficulty];
+            if (InterlockedIncrement(&logged2) <= 5)
+                plog("[difficulty] NPC hit on player %s: damage scale %.2f -> %.2f (x%.1f)",
+                     entity_name(self), before, a11, g_diff_factor[g_difficulty]);
+        }
+    } else if (g_difficulty > 0 && !(a10 & 0xFF)) {
         int human = 1;
         __try { human = is_human_character(self); } __except (EXCEPTION_EXECUTE_HANDLER) { human = 1; }
         if (!human) {
@@ -6629,7 +6641,7 @@ static int difficulty_apply(char *msg, int mn)
         if (!t) { if (msg) _snprintf(msg, mn, "[admin] difficulty: damage table not loaded yet"); return 0; }
         if (!g_dmg_base_ok) { for (i = 0; i < 3; i++) g_dmg_base[i] = t[1 + i]; g_dmg_base_ok = 1; }
         g_diff_applied = g_difficulty;
-        for (i = 0; i < 3; i++) t[1 + i] = g_dmg_base[i] * g_diff_factor[g_difficulty];
+        for (i = 0; i < 3; i++) t[1 + i] = g_dmg_base[i];   /* 0.77: per-hit scaling in hook_char_damage instead */
         ((fn_void_ptr)VA(0x10093CD0))();
         {
             void *eng = ((fn_void_ptr)VA(0x10093D00))();
@@ -7194,7 +7206,9 @@ static void rv_tick(void)
             if (sc.c[j].alive) alive = &sc.c[j];
             if (sc.c[j].id == r->alive_id) old = &sc.c[j];
         }
-        if (alive && alive->id != r->body_id) {
+        /* 0.77: an MP respawn brings the SAME character entity back (same id as the body; host log
+           2026-11-18 15:21: revived at 105.0, alive at the spawn at 105.2, never seen as "new") */
+        if (alive && (alive->id != r->body_id || r->state != RV_NONE)) {
             if (r->state == RV_DOWN && r->want_spawn) {
                 /* the revived player's new character: put it at the body on both PCs */
                 if (ft_active(net)) {
