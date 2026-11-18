@@ -31,7 +31,7 @@
 #include <ctype.h>
 #include <math.h>
 
-#define COOPMOD_VERSION "CoopMod proxy 0.74"
+#define COOPMOD_VERSION "CoopMod proxy 0.75"
 #define BOS_PREFERRED_BASE 0x10000000u
 
 static HMODULE g_self;
@@ -4640,6 +4640,9 @@ struct frz_pkt { DWORD magic; int frame; WORD n, last; struct frz_rec r[FRZ_PER_
 struct tp_rec { DWORD id; float x, y, z; };
 struct tp_pkt { DWORD magic; int frame; WORD n, last; struct tp_rec r[TP_PER_FRAME]; };
 struct giveup_pkt { DWORD magic; char name[60]; };
+#define NPC_MAGIC_DIFF   0x31564D43u      /* "CMV1" master -> client: difficulty level (0.75) */
+static int g_difficulty;
+static volatile LONG g_diff_rx = -1;
 static void rv_giveup_push(const char *name);
 static void rv_client_note(DWORD id);
 
@@ -4862,9 +4865,13 @@ static int npc_on_packet(SOCKET s, const char *buf, int len, const struct sockad
     if (len < 4) return 0;
     magic = *(const DWORD *)buf;
     if (magic != NPC_MAGIC_CMD && magic != NPC_MAGIC_DRV && magic != NPC_MAGIC_HELLO && magic != NPC_MAGIC_FRZ &&
-        magic != NPC_MAGIC_STATE && magic != NPC_MAGIC_TP && magic != NPC_MAGIC_GIVEUP) return 0;
+        magic != NPC_MAGIC_STATE && magic != NPC_MAGIC_TP && magic != NPC_MAGIC_GIVEUP && magic != NPC_MAGIC_DIFF) return 0;
     if (!g_net_npc_commands || !(net = kt_net())) return 1;
     now = GetTickCount();
+    if (magic == NPC_MAGIC_DIFF) {
+        if (net[0xDA4] == 0 && len >= 8) InterlockedExchange(&g_diff_rx, *(const LONG *)(buf + 4));
+        return 1;
+    }
     if (magic == NPC_MAGIC_GIVEUP) {
         char nm[61];
         if (net[0xDA4] != 1 || len < 8) return 1;
@@ -6544,7 +6551,7 @@ static const char *g_admin_help1[] = {
 static const char *g_admin_help2[] = {
     "[admin] help 2/2 (level, settings, keys) - /help1 for moving",
     "[admin] /door  /doors [open]  /obj  /skip [who]  /call <Function> [who]",
-    "[admin] /difficulty [easy|medium|hard] (enemies x1/x1.6/x2)  /champions [1|2|3] per fight",
+    "[admin] /difficulty [easy|medium|hard|veteran|insane] (enemies x1/1.6/2/2.5/3)  /champions [1|2|3] per fight",
     "[admin] /lives [n|off|reset] [restart|warn]  /wipe restart|warn|off  /revive [on|off|time s|radius u|bleed s]  /giveup",
     "[admin] keys: host Ctrl+F3 skip F5 fwd F6 thru F7 door F8 undo F9 bring F10 goto F11 heal F12 god; anyone Ctrl+F4 = unstick",
 };
@@ -6554,12 +6561,15 @@ static const char *g_admin_help2[] = {
    singleton at [0x1025DA70] (+0 FriendlyFire, +4 Easy, +8 Normal, +0xC Hard). The slot index comes
    from engine vtable +0x7C. The proxy scales all three slots, so "easy" stays exactly what co-op had. */
 static int g_champions = 1;              /* coop_config.ini [proxy] champions: champions per fight (1-3) */
-static int g_difficulty;                 /* 0 easy, 1 medium, 2 hard (coop_config.ini [proxy] difficulty) */
+static int g_difficulty;                 /* 0 easy .. 4 insane (coop_config.ini [proxy] difficulty) */
+#define DIFF_N 5
 static float g_dmg_base[3];
+static int g_diff_applied = -1;          /* level last written into the damage table */
 static int g_dmg_base_ok;
-static const char *g_diff_names[3] = { "easy", "medium", "hard" };
-static const float g_diff_factor[3] = { 1.0f, 1.6f, 2.0f };   /* enemy damage to players */
-static const float g_diff_health[3] = { 1.0f, 1.6f, 2.0f };   /* enemy health (shield, armor and flesh) */
+/* 0.75: veteran and insane added (up to x3) */
+static const char *g_diff_names[DIFF_N] = { "easy", "medium", "hard", "veteran", "insane" };
+static const float g_diff_factor[DIFF_N] = { 1.0f, 1.6f, 2.0f, 2.5f, 3.0f };   /* enemy damage to players */
+static const float g_diff_health[DIFF_N] = { 1.0f, 1.6f, 2.0f, 2.5f, 3.0f };   /* enemy health (shield, armor and flesh) */
 
 /* 0.60: enemy health. Bos 0x100108D0 is the character damage method (thiscall, 11 stack args, ret 2Ch).
    arg 10 is set when an NPC dealt the hit (NPCDamageMultiplier is applied then), and arg 11 scales the
@@ -6618,6 +6628,7 @@ static int difficulty_apply(char *msg, int mn)
         if (!t) t = (float *)((fn_void_ptr)VA(0x10003FA0))();
         if (!t) { if (msg) _snprintf(msg, mn, "[admin] difficulty: damage table not loaded yet"); return 0; }
         if (!g_dmg_base_ok) { for (i = 0; i < 3; i++) g_dmg_base[i] = t[1 + i]; g_dmg_base_ok = 1; }
+        g_diff_applied = g_difficulty;
         for (i = 0; i < 3; i++) t[1 + i] = g_dmg_base[i] * g_diff_factor[g_difficulty];
         ((fn_void_ptr)VA(0x10093CD0))();
         {
@@ -7114,6 +7125,30 @@ static void rv_key_tick(BYTE *net)
     }
 }
 
+/* 0.75: the difficulty changes damage on every PC's simulation, so the clients must use the host's level
+   (before, only the host knew it and resyncs corrected the client). Host: sent every 2 s; client: applied. */
+static int difficulty_apply(char *msg, int mn);
+static void diff_sync_tick(BYTE *net)
+{
+    static DWORD sent;
+    LONG rx;
+    if (net[0xDA4] == 1) {
+        DWORD now = GetTickCount();
+        if (now - sent >= 2000) {
+            DWORD p[2];
+            sent = now;
+            p[0] = NPC_MAGIC_DIFF; p[1] = (DWORD)g_difficulty;
+            npc_send_packet(p, sizeof(p));
+        }
+        return;
+    }
+    rx = g_diff_rx;
+    if (rx >= 0 && rx < DIFF_N && (rx != g_difficulty || g_diff_applied != rx)) {
+        g_difficulty = (int)rx;
+        if (difficulty_apply(NULL, 0)) plog("[difficulty] client: host plays %s - applied here too", g_diff_names[rx]);
+    }
+}
+
 static void rv_tick(void)
 {
     static DWORD last;
@@ -7126,6 +7161,7 @@ static void rv_tick(void)
     if (!net || !iface) return;
     if (lc && (pl = char_player(lc))) __try { g_rv_my_player = *(DWORD *)(pl + 0x1C); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     rv_key_tick(net);
+    diff_sync_tick(net);
     if (net[0xDA4] == 0) {                                  /* client: only the missed-teleport watch */
         for (i = 0; i < 4 && !(g_rv_fix[i].id && now < g_rv_fix[i].until); i++) {}
         if (i < 4) __try { for_each_entity(iface, 5, 1, rv_fix_cb, NULL); } __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -7318,9 +7354,11 @@ static int admin_build(const struct admin_req *r, char *code, int cn)
         char m[200];
         if (nt > 1) {
             int want = -1;
-            for (i = 0; i < 3; i++) if (!_stricmp(tok[1], g_diff_names[i])) want = i;
+            for (i = 0; i < DIFF_N; i++) if (!_stricmp(tok[1], g_diff_names[i])) want = i;
             if (!_stricmp(tok[1], "normal")) want = 1;
-            if (want < 0) { admin_say(&r->ctx, "[admin] /difficulty easy | medium | hard"); return 0; }
+            if (!_stricmp(tok[1], "nightmare") || !_stricmp(tok[1], "max")) want = DIFF_N - 1;
+            if (want < 0 && tok[1][0] >= '1' && tok[1][0] <= '5' && !tok[1][1]) want = tok[1][0] - '1';   /* /difficulty 1..5 */
+            if (want < 0) { admin_say(&r->ctx, "[admin] /difficulty easy | medium | hard | veteran | insane  (or 1-5)"); return 0; }
             if (strcmp(nw_state_name(), "MASTER") != 0) { admin_say(&r->ctx, "[admin] difficulty: only the host's game decides damage"); return 0; }
             g_difficulty = want;
             WritePrivateProfileStringA("proxy", "difficulty", g_diff_names[want], g_config_path);
@@ -7926,7 +7964,7 @@ static void load_config(void)
     {
         char dv[16]; int i;
         GetPrivateProfileStringA("proxy", "difficulty", "easy", dv, sizeof(dv), path);
-        for (i = 0; i < 3; i++) if (!_stricmp(dv, g_diff_names[i])) g_difficulty = i;
+        for (i = 0; i < DIFF_N; i++) if (!_stricmp(dv, g_diff_names[i])) g_difficulty = i;
         if (!_stricmp(dv, "normal")) g_difficulty = 1;
         g_champions = GetPrivateProfileIntA("proxy", "champions", 1, path);
         {
