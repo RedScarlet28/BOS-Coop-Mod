@@ -1,0 +1,15 @@
+-- COOP_Patrol: campaign mission Patrol_1 hosted as a multiplayer level (CoopMod).
+-- Scene = campaign Patrol_1 + MP spawn points / areas / camera points (from COOP_8),
+-- Events.kt3 = campaign trigger boxes + the two MP spawn sectors at the campaign start.
+DEF_FirstSubLevel = "SubLevel_0"
+
+function DEF_GetSubLevelFiles( SubLevelName )
+	if (SubLevelName == "SubLevel_0")
+	then
+		return "Patrol_1\\Patrol_1.Kt3";
+	end
+end
+
+function DEF_GetLevelScriptFiles( )
+	return "Main.lua", "Camp_1.lua", "Trench_1.lua", "Trench_2.lua", "Debug.lua", "Tutorial_Tips.lua", "Sport.lua", "ConfigMerc.lua", "Coop_Patrol.lua";
+end

@@ -1,0 +1,5 @@
+local id = GetCharacterID("Char_WRF_Camp_1_Garde")
+local bm = GetVarValue(id, "BodyModel")
+print("[test] Garde BodyModel: " .. (bm or "nil") .. " head " .. (GetVarValue(id, "HeadModel") or "nil"))
+SetVarValue(id, "BodyModel", bm)
+print("[test] set back ok")

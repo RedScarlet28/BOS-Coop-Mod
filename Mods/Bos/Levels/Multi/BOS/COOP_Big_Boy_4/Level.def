@@ -1,0 +1,26 @@
+-- COOP_Big_Boy_4: campaign mission Big_Boy_4 hosted as a multiplayer level (CoopMod, make_coop_level.py).
+-- Scene = campaign scene + MP_Patrol spawn points / areas / idle cameras at the player start;
+-- Events.kt3 = campaign trigger boxes + MP_Patrol's two spawn sectors; Coop_Big_Boy_4.lua = co-op adjustments.
+DEF_FirstSubLevel = "SubLevel_0"
+
+----------------------------------------------------
+--							DEF_GetSubLevelFiles  							
+----------------------------------------------------
+function DEF_GetSubLevelFiles( SubLevelName )
+
+	if (SubLevelName == "SubLevel_0")
+	then
+		return "Big_Boy_4\\Big Boy_04.Kt3";
+	end
+
+end
+
+----------------------------------------------------
+--							DEF_GetLevelScriptFiles							
+----------------------------------------------------
+function DEF_GetLevelScriptFiles( )
+
+	return "Main.lua", "Debug.lua", "Grotte.lua", "Suite.lua", "Coop_Big_Boy_4.lua";
+
+end
+

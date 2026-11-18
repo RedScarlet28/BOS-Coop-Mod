@@ -1,0 +1,26 @@
+-- COOP_Cargo_Bay_1: campaign mission Cargo_Bay_1 hosted as a multiplayer level (CoopMod, make_coop_level.py).
+-- Scene = campaign scene + MP_Patrol spawn points / areas / idle cameras at the player start;
+-- Events.kt3 = campaign trigger boxes + MP_Patrol's two spawn sectors; Coop_Cargo_Bay_1.lua = co-op adjustments.
+DEF_FirstSubLevel = "SubLevel_0"
+
+----------------------------------------------------
+--							DEF_GetSubLevelFiles  							
+----------------------------------------------------
+function DEF_GetSubLevelFiles( SubLevelName )
+
+	if (SubLevelName == "SubLevel_0")
+	then
+		return "Cargo_Bay_1\\Cargo_Bay_1.Kt3", "Cargo_Bay_1\\Cargo_Bay_1_OBJ_DCA.Kt3";
+	end
+
+end
+
+----------------------------------------------------
+--							DEF_GetLevelScriptFiles							
+----------------------------------------------------
+function DEF_GetLevelScriptFiles( )
+
+	return "Main.lua", "Island.lua", "Plain.lua", "EndOfLevel.lua", "Debug.lua", "Camp1.lua", "ConfigMerc.lua", "Intro.lua", "Coop_Cargo_Bay_1.lua";
+
+end
+

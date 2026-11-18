@@ -1,0 +1,26 @@
+-- COOP_Tanks_in_the_city_4: campaign mission Tanks_in_the_city_4 hosted as a multiplayer level (CoopMod, make_coop_level.py).
+-- Scene = campaign scene + MP_Patrol spawn points / areas / idle cameras at the player start;
+-- Events.kt3 = campaign trigger boxes + MP_Patrol's two spawn sectors; Coop_Tanks_in_the_city_4.lua = co-op adjustments.
+DEF_FirstSubLevel = "SubLevel_0"
+
+----------------------------------------------------
+--							DEF_GetSubLevelFiles  							
+----------------------------------------------------
+function DEF_GetSubLevelFiles( SubLevelName )
+
+	if (SubLevelName == "SubLevel_0")
+	then
+		return "Tanks_in_the_city_4\\Tanks_in_the_city_4.Kt3";
+	end
+
+end
+
+----------------------------------------------------
+--							DEF_GetLevelScriptFiles							
+----------------------------------------------------
+function DEF_GetLevelScriptFiles( )
+
+	return "EndOfLevel.lua", "main.lua", "Game.lua", "Sequence.lua", "Debug.lua", "Objectives.lua", "Coop_Tanks_in_the_city_4.lua";
+
+end
+

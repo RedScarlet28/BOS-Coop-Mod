@@ -1,0 +1,26 @@
+-- COOP_Good_Choice: campaign mission Good_Choice hosted as a multiplayer level (CoopMod, make_coop_level.py).
+-- Scene = campaign scene + MP_Patrol spawn points / areas / idle cameras at the player start;
+-- Events.kt3 = campaign trigger boxes + MP_Patrol's two spawn sectors; Coop_Good_Choice.lua = co-op adjustments.
+DEF_FirstSubLevel = "SubLevel_0"
+
+----------------------------------------------------
+--							DEF_GetSubLevelFiles  							
+----------------------------------------------------
+function DEF_GetSubLevelFiles( SubLevelName )
+
+	if (SubLevelName == "SubLevel_0")
+	then
+		return "Good_Choice\\Good_Choice.Kt3", "Good_Choice\\Good_Choice_OBJ_Wall_Before_Explode.Kt3";
+	end
+
+end
+
+----------------------------------------------------
+--							DEF_GetLevelScriptFiles							
+----------------------------------------------------
+function DEF_GetLevelScriptFiles( )
+
+	return "main.lua", "dialogue.lua", "phase1.lua", "timer.lua", "eventBoxes.lua", "teletransportation.lua", "MisterFive.lua", "randomSpeakerDialogues.lua", "phase2.lua", "phase3.lua", "interieur-exterieur.lua", "snipersEventBoxes.lua", "cam.lua", "DEBUG.lua", "sound.lua", "Coop_Good_Choice.lua";
+
+end
+

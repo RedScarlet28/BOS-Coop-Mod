@@ -1,0 +1,26 @@
+-- COOP_Eradication_1: campaign mission Eradication_1 hosted as a multiplayer level (CoopMod, make_coop_level.py).
+-- Scene = campaign scene + MP_Patrol spawn points / areas / idle cameras at the player start;
+-- Events.kt3 = campaign trigger boxes + MP_Patrol's two spawn sectors; Coop_Eradication_1.lua = co-op adjustments.
+DEF_FirstSubLevel = "SubLevel_0"
+
+----------------------------------------------------
+--							DEF_GetSubLevelFiles  							
+----------------------------------------------------
+function DEF_GetSubLevelFiles( SubLevelName )
+
+	if (SubLevelName == "SubLevel_0")
+	then
+		return "Resistance_1\\Resistance_1.Kt3";
+	end
+
+end
+
+----------------------------------------------------
+--							DEF_GetLevelScriptFiles							
+----------------------------------------------------
+function DEF_GetLevelScriptFiles( )
+
+	return "EndOfLevel.lua", "Explosion.lua", "Debug.lua", "Camp.lua", "Main.lua", "Plaines_Ruines.lua", "INTRODUCTION.lua", "Ingenieur.lua", "EXOS_GAMEPLAY.lua", "AVANT_CAMP.lua", "CINE_CAMP.lua", "ConfigMerc.lua", "Coop_Eradication_1.lua";
+
+end
+

@@ -1,0 +1,26 @@
+-- COOP_Resistance_2: campaign mission Resistance_2 hosted as a multiplayer level (CoopMod, make_coop_level.py).
+-- Scene = campaign scene + MP_Patrol spawn points / areas / idle cameras at the player start;
+-- Events.kt3 = campaign trigger boxes + MP_Patrol's two spawn sectors; Coop_Resistance_2.lua = co-op adjustments.
+DEF_FirstSubLevel = "SubLevel_0"
+
+----------------------------------------------------
+--							DEF_GetSubLevelFiles  							
+----------------------------------------------------
+function DEF_GetSubLevelFiles( SubLevelName )
+
+	if (SubLevelName == "SubLevel_0")
+	then
+		return "Resistance_2\\Resistance_2.Kt3";
+	end
+
+end
+
+----------------------------------------------------
+--							DEF_GetLevelScriptFiles							
+----------------------------------------------------
+function DEF_GetLevelScriptFiles( )
+
+	return "cloister.lua", "dialogue.lua", "main.lua", "Debug.lua", "randomDialogues.lua", "huber.lua", "heliport.lua", "court.lua", "teletransportation.lua", "cam.lua", "Coop_Resistance_2.lua";
+
+end
+

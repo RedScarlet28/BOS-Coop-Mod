@@ -1,0 +1,7 @@
+coop_logs/
+*.pyc
+__pycache__/
+CoopMod/obj/
+CoopMod/decomp*/
+CoopMod/testenv/
+Bos_core.dll

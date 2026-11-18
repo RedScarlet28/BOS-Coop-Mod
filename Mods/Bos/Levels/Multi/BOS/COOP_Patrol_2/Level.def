@@ -1,0 +1,16 @@
+-- COOP_Patrol_2: campaign mission Patrol_2 hosted as a multiplayer level (CoopMod).
+-- Scene = campaign Patrol_2 + MP spawn points / areas / camera points (build_coop_scene.py, donor MP_Patrol),
+-- Events.kt3 = campaign trigger boxes + MP_Patrol's two spawn sectors moved to the campaign start.
+-- The champion (BOS fight) comes from Debug_GetSelectedChampions in Debug.lua (Master Loa).
+DEF_FirstSubLevel = "SubLevel_0"
+
+function DEF_GetSubLevelFiles( SubLevelName )
+	if (SubLevelName == "SubLevel_0")
+	then
+		return "Patrol_2\\Patrol_2.Kt3";
+	end
+end
+
+function DEF_GetLevelScriptFiles( )
+	return "Camp_2.lua", "Camp_3.lua", "Camp_4.lua", "Main.lua", "Explosion.lua", "Spot.lua", "Debug.lua", "Mordor.lua", "Coop_Patrol_2.lua";
+end

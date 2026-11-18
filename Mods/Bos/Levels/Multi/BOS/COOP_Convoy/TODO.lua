@@ -1,0 +1,2 @@
+-- 2ème timer
+-- chngement de comportement pour les waypoint

@@ -1,0 +1,26 @@
+-- COOP_Alaska_Special_Forces_1: campaign mission Alaska_Special_Forces_1 hosted as a multiplayer level (CoopMod, make_coop_level.py).
+-- Scene = campaign scene + MP_Patrol spawn points / areas / idle cameras at the player start;
+-- Events.kt3 = campaign trigger boxes + MP_Patrol's two spawn sectors; Coop_Alaska_Special_Forces_1.lua = co-op adjustments.
+DEF_FirstSubLevel = "SubLevel_0"
+
+----------------------------------------------------
+--							DEF_GetSubLevelFiles  							
+----------------------------------------------------
+function DEF_GetSubLevelFiles( SubLevelName )
+
+	if (SubLevelName == "SubLevel_0")
+	then
+		return "Alaska_Special_Forces_1\\Alaska_Special_Forces_1.Kt3", "Alaska_Special_Forces_1\\OBJ_Voitures_OK.Kt3";
+	end
+
+end
+
+----------------------------------------------------
+--							DEF_GetLevelScriptFiles							
+----------------------------------------------------
+function DEF_GetLevelScriptFiles( )
+
+	return "Start.lua", "Reload.lua", "dialogue.lua", "Place.lua", "Main.lua", "Avenue.lua", "Warehouse.lua", "Debug.lua", "SCENE.lua", "FX_CARS.lua", "Boss.lua", "ConfigMerc.lua", "Coop_Alaska_Special_Forces_1.lua";
+
+end
+
