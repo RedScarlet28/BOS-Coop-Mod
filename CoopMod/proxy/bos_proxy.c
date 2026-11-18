@@ -31,7 +31,7 @@
 #include <ctype.h>
 #include <math.h>
 
-#define COOPMOD_VERSION "CoopMod proxy 0.75"
+#define COOPMOD_VERSION "CoopMod proxy 0.76"
 #define BOS_PREFERRED_BASE 0x10000000u
 
 static HMODULE g_self;
@@ -6551,7 +6551,7 @@ static const char *g_admin_help1[] = {
 static const char *g_admin_help2[] = {
     "[admin] help 2/2 (level, settings, keys) - /help1 for moving",
     "[admin] /door  /doors [open]  /obj  /skip [who]  /call <Function> [who]",
-    "[admin] /difficulty [easy|medium|hard|veteran|insane] (enemies x1/1.6/2/2.5/3)  /champions [1|2|3] per fight",
+    "[admin] /difficulty 1-9 or easy|medium|hard|veteran|insane|brutal|deadly|hell|impossible (x1/1.6/2/2.5/3/4/5/6/8)  /champions [1|2|3]",
     "[admin] /lives [n|off|reset] [restart|warn]  /wipe restart|warn|off  /revive [on|off|time s|radius u|bleed s]  /giveup",
     "[admin] keys: host Ctrl+F3 skip F5 fwd F6 thru F7 door F8 undo F9 bring F10 goto F11 heal F12 god; anyone Ctrl+F4 = unstick",
 };
@@ -6562,14 +6562,14 @@ static const char *g_admin_help2[] = {
    from engine vtable +0x7C. The proxy scales all three slots, so "easy" stays exactly what co-op had. */
 static int g_champions = 1;              /* coop_config.ini [proxy] champions: champions per fight (1-3) */
 static int g_difficulty;                 /* 0 easy .. 4 insane (coop_config.ini [proxy] difficulty) */
-#define DIFF_N 5
+#define DIFF_N 9
 static float g_dmg_base[3];
 static int g_diff_applied = -1;          /* level last written into the damage table */
 static int g_dmg_base_ok;
-/* 0.75: veteran and insane added (up to x3) */
-static const char *g_diff_names[DIFF_N] = { "easy", "medium", "hard", "veteran", "insane" };
-static const float g_diff_factor[DIFF_N] = { 1.0f, 1.6f, 2.0f, 2.5f, 3.0f };   /* enemy damage to players */
-static const float g_diff_health[DIFF_N] = { 1.0f, 1.6f, 2.0f, 2.5f, 3.0f };   /* enemy health (shield, armor and flesh) */
+/* 0.75: veteran and insane added (up to x3); 0.76: brutal, deadly, hell, impossible (up to x8) */
+static const char *g_diff_names[DIFF_N] = { "easy", "medium", "hard", "veteran", "insane", "brutal", "deadly", "hell", "impossible" };
+static const float g_diff_factor[DIFF_N] = { 1.0f, 1.6f, 2.0f, 2.5f, 3.0f, 4.0f, 5.0f, 6.0f, 8.0f };   /* enemy damage to players */
+static const float g_diff_health[DIFF_N] = { 1.0f, 1.6f, 2.0f, 2.5f, 3.0f, 4.0f, 5.0f, 6.0f, 8.0f };   /* enemy health (shield, armor and flesh) */
 
 /* 0.60: enemy health. Bos 0x100108D0 is the character damage method (thiscall, 11 stack args, ret 2Ch).
    arg 10 is set when an NPC dealt the hit (NPCDamageMultiplier is applied then), and arg 11 scales the
@@ -7357,8 +7357,8 @@ static int admin_build(const struct admin_req *r, char *code, int cn)
             for (i = 0; i < DIFF_N; i++) if (!_stricmp(tok[1], g_diff_names[i])) want = i;
             if (!_stricmp(tok[1], "normal")) want = 1;
             if (!_stricmp(tok[1], "nightmare") || !_stricmp(tok[1], "max")) want = DIFF_N - 1;
-            if (want < 0 && tok[1][0] >= '1' && tok[1][0] <= '5' && !tok[1][1]) want = tok[1][0] - '1';   /* /difficulty 1..5 */
-            if (want < 0) { admin_say(&r->ctx, "[admin] /difficulty easy | medium | hard | veteran | insane  (or 1-5)"); return 0; }
+            if (want < 0 && tok[1][0] >= '1' && tok[1][0] < '1' + DIFF_N && !tok[1][1]) want = tok[1][0] - '1';   /* /difficulty 1..9 */
+            if (want < 0) { admin_say(&r->ctx, "[admin] /difficulty 1-9: easy medium hard veteran insane brutal deadly hell impossible (x1 ... x8)"); return 0; }
             if (strcmp(nw_state_name(), "MASTER") != 0) { admin_say(&r->ctx, "[admin] difficulty: only the host's game decides damage"); return 0; }
             g_difficulty = want;
             WritePrivateProfileStringA("proxy", "difficulty", g_diff_names[want], g_config_path);

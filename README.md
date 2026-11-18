@@ -54,7 +54,7 @@ both PCs in sync.
 | `/giveup` | while downed: respawn now |
 | `/lives [n\|off\|reset] [restart\|warn]` | shared party lives and what happens when they run out |
 | `/wipe restart\|warn\|off` | what happens when every player is down |
-| `/difficulty easy\|medium\|hard\|veteran\|insane` | enemy damage and health x1 / 1.6 / 2 / 2.5 / 3 |
+| `/difficulty 1-9` or a name | enemy damage and health: easy x1, medium x1.6, hard x2, veteran x2.5, insane x3, brutal x4, deadly x5, hell x6, impossible x8 |
 | `/champions 1\|2\|3` | champions per BOS fight |
 | `/goto`, `/bring`, `/tp`, `/fwd`, `/thru`, `/undo` | get unstuck / regroup |
 | `/door`, `/doors`, `/obj`, `/skip` | fix soft-locked doors and objectives |
