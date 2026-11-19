@@ -31,7 +31,7 @@
 #include <ctype.h>
 #include <math.h>
 
-#define COOPMOD_VERSION "CoopMod proxy 0.79"
+#define COOPMOD_VERSION "CoopMod proxy 0.80"
 #define BOS_PREFERRED_BASE 0x10000000u
 
 static HMODULE g_self;
@@ -7841,9 +7841,368 @@ static void kits_char_dump(BYTE *e)
 }
 
 /* ---------------------------------------------------------------------------------------------------
+ * 0.80: text overlay drawn by the proxy itself on top of every frame (IDirect3DDevice9::Present).
+ * 0.79 used the game's HUD script text (DisplayString): it ran without a Lua error but nothing showed
+ * in a multiplayer game. The device is found in kte_dx9's globals (a pointer whose vtable lies in
+ * d3d9.dll and that answers QueryInterface(IID_IDirect3DDevice9)); its own vtable pointer is swapped
+ * for a copy with Present replaced, so only this device is affected and the Steam overlay still works.
+ * The font is drawn once with GDI into a D3DPOOL_MANAGED texture, so a device reset (alt-tab) needs
+ * nothing from the proxy. Render states are saved in a state block made and released every frame.
+ * ------------------------------------------------------------------------------------------------- */
+#include <d3d9.h>
+#pragma comment(lib, "gdi32.lib")
+struct ov_line { char text[124]; DWORD color; };
+#define OV_MENU_MAX 20
+static struct ov_line g_ov_menu[OV_MENU_MAX], g_ov_down[3];
+static int g_ov_menu_n, g_ov_down_n;
+static volatile LONG g_ov_lock;
+static IDirect3DDevice9 *g_ov_dev;
+typedef HRESULT (STDMETHODCALLTYPE *fn_present)(IDirect3DDevice9 *, const RECT *, const RECT *, HWND, const RGNDATA *);
+static fn_present o_present;
+static void *g_ov_vt[256];   /* IDirect3DDevice9Ex has 134 entries; copy generously, callers may use them */
+static IDirect3DTexture9 *g_ov_tex;
+static int g_ov_font_h, g_ov_line_h, g_ov_tried, g_ov_broken;
+static float g_ov_u[96], g_ov_v[96];
+static int g_ov_cw[96];
+#define OV_TEX 512
+static const GUID g_iid_dev9 = { 0xd0223b96, 0xbf7a, 0x43fd, { 0x92, 0xbd, 0xa4, 0x3b, 0x0d, 0x82, 0xb9, 0xeb } };
+
+static void ov_lock(void) { while (InterlockedExchange(&g_ov_lock, 1)) Sleep(0); }
+static void ov_unlock(void) { InterlockedExchange(&g_ov_lock, 0); }
+
+static DWORD mod_size(HMODULE m)
+{
+    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((BYTE *)m + ((IMAGE_DOS_HEADER *)m)->e_lfanew);
+    return nt->OptionalHeader.SizeOfImage;
+}
+
+static IDirect3DDevice9 *ov_check(DWORD p, DWORD d0, DWORD d1)
+{
+    IDirect3DDevice9 *r = NULL;
+    __try {
+        DWORD vt;
+        void *q = NULL;
+        if (p < 0x10000 || (p & 3) || IsBadReadPtr((void *)p, 4)) return NULL;
+        vt = *(DWORD *)p;
+        if (vt < 0x10000 || (vt & 3) || IsBadReadPtr((void *)vt, 119 * 4)) return NULL;
+        if (((DWORD *)vt)[0] < d0 || ((DWORD *)vt)[0] >= d1) return NULL;   /* QueryInterface must be d3d9's code */
+        if (((IUnknown *)p)->lpVtbl->QueryInterface((IUnknown *)p, &g_iid_dev9, &q) == S_OK && q) {
+            ((IUnknown *)q)->lpVtbl->Release((IUnknown *)q);
+            if (q == (void *)p) r = (IDirect3DDevice9 *)p;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { r = NULL; }
+    return r;
+}
+
+static void ov_draw(IDirect3DDevice9 *dev);
+static int g_ov_test, g_ov_test_frames;   /* coop_config.ini overlay_test=1: test line from the main menu + one frame saved */
+static void ov_test_save(IDirect3DDevice9 *dev)
+{
+    typedef HRESULT (WINAPI *fn_save)(const char *, int, IDirect3DSurface9 *, const void *, const RECT *);
+    HMODULE x = GetModuleHandleA("d3dx9_25.dll");
+    fn_save sv = x ? (fn_save)GetProcAddress(x, "D3DXSaveSurfaceToFileA") : NULL;
+    IDirect3DSurface9 *bb = NULL;
+    char path[MAX_PATH];
+    HRESULT hr = E_FAIL;
+    _snprintf(path, sizeof(path), "%scoop_logs\\overlay_test.bmp", g_game_dir);
+    path[sizeof(path) - 1] = 0;
+    if (sv && dev->lpVtbl->GetBackBuffer(dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) == D3D_OK && bb) {
+        hr = sv(path, 0 /* BMP */, bb, NULL, NULL);
+        bb->lpVtbl->Release(bb);
+    }
+    plog("[overlay] test frame saved to %s: %08X", path, hr);
+}
+static volatile LONG g_ov_presents;
+static DWORD g_ov_exc_ip, g_ov_exc_addr;
+static int ov_exc(EXCEPTION_POINTERS *ep)
+{
+    g_ov_exc_ip = (DWORD)ep->ExceptionRecord->ExceptionAddress;
+    g_ov_exc_addr = ep->ExceptionRecord->NumberParameters > 1 ? (DWORD)ep->ExceptionRecord->ExceptionInformation[1] : 0;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+static HRESULT STDMETHODCALLTYPE hook_present(IDirect3DDevice9 *dev, const RECT *a, const RECT *b, HWND w, const RGNDATA *c)
+{
+    if (InterlockedIncrement(&g_ov_presents) == 1)
+        plog("[overlay] first Present through the hook (device %p, original %p)", dev, o_present);
+    if ((g_ov_menu_n || g_ov_down_n) && !g_ov_broken) {
+        __try { ov_draw(dev); } __except (ov_exc(GetExceptionInformation())) {
+            static volatile LONG n;
+            HMODULE hm = NULL;
+            char mn[MAX_PATH] = "?";
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)g_ov_exc_ip, &hm))
+                GetModuleFileNameA(hm, mn, sizeof(mn));
+            if (InterlockedIncrement(&n) <= 3)
+                plog("[overlay] draw faulted at %08X (%s +%X), address %08X - overlay off", g_ov_exc_ip,
+                     strrchr(mn, 92) ? strrchr(mn, 92) + 1 : mn, g_ov_exc_ip - (DWORD)hm, g_ov_exc_addr);
+            g_ov_broken = 1;
+        }
+        if (g_ov_test && ++g_ov_test_frames == 60) __try { ov_test_save(dev); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    return o_present(dev, a, b, w, c);
+}
+
+/* game thread: find the game's device and hook its Present (once). kte_dx9's renderer object (vtable
+   kte_dx9 RVA 0x27148, constructor 0x10005AB0) keeps the IDirect3DDevice9 at +0x584 (Present is called
+   through it at 0x10008A71). The renderer is found by scanning committed read-write memory for that
+   vtable; QueryInterface(IID_IDirect3DDevice9) on +0x584 must give the same pointer back.
+   (0.80 first build: a throwaway Direct3D device hit a debug break in d3d9.dll - not used.) */
+static void ov_install(void)
+{
+    HMODULE k = GetModuleHandleA("kte_dx9.dll"), d = GetModuleHandleA("d3d9.dll");
+    DWORD d0, d1, rvt, t0 = GetTickCount();
+    BYTE *a;
+    MEMORY_BASIC_INFORMATION mi;
+    IDirect3DDevice9 *dev = NULL;
+    int cands = 0;
+    if (g_ov_tried) return;
+    g_ov_tried = 1;
+    if (!k || !d) { plog("[overlay] kte_dx9.dll / d3d9.dll not loaded - no overlay"); return; }
+    d0 = (DWORD)d; d1 = d0 + mod_size(d);
+    rvt = (DWORD)k + 0x27148;
+    if (*(WORD *)((BYTE *)k + 0x5AB9) != 0x06C7 || *(DWORD *)((BYTE *)k + 0x5ABB) != rvt) {   /* mov dword ptr [esi], vtable */
+        plog("[overlay] kte_dx9 renderer constructor not as expected (%08X %08X) - no overlay",
+             *(DWORD *)((BYTE *)k + 0x5AB9), *(DWORD *)((BYTE *)k + 0x5ABB));
+        return;
+    }
+    for (a = (BYTE *)0x10000; a < (BYTE *)0x7FFE0000 && !dev; a = (BYTE *)mi.BaseAddress + mi.RegionSize) {
+        DWORD *p, *e;
+        if (!VirtualQuery(a, &mi, sizeof(mi))) break;
+        if (mi.State != MEM_COMMIT || mi.Type != MEM_PRIVATE || mi.Protect != PAGE_READWRITE) continue;
+        p = (DWORD *)mi.BaseAddress; e = (DWORD *)((BYTE *)mi.BaseAddress + mi.RegionSize - 0x800);
+        __try {
+            for (; p < e; p++) {
+                if (*p != rvt) continue;
+                cands++;
+                /* +0x584 is the device field (kte_dx9 0x10008A68); its vtable may already be someone's copy
+                   (Steam overlay: a heap vtable), so only QueryInterface decides */
+                dev = ov_check(p[0x584 / 4], d0, d1);
+                if (dev) plog("[overlay] renderer %p: Direct3D device at +0x584 (vtable %08X%s)", p, *(DWORD *)dev,
+                              *(DWORD *)dev >= d0 && *(DWORD *)dev < d1 ? ", d3d9's own" : ", already hooked by another program");
+                {
+                    int o;
+                    for (o = 0; o < 0x800 / 4 && !dev; o++) {
+                        DWORD v = p[o];
+                        if (v >= d0 && v < d1) continue;
+                        if ((dev = ov_check(v, d0, d1)) != NULL)
+                            plog("[overlay] renderer %p: Direct3D device at +0x%X", p, o * 4);
+                    }
+                    if (!dev && cands <= 4 && p[0x584 / 4] > 0x10000) __try {
+                        DWORD *vt = *(DWORD **)p[0x584 / 4];
+                        int s2;
+                        for (s2 = 0; s2 < 18; s2 += 1) {
+                            HMODULE hm = NULL;
+                            char mn[MAX_PATH] = "?";
+                            if (s2 > 2 && s2 != 16 && s2 != 17) continue;
+                            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)vt[s2], &hm))
+                                GetModuleFileNameA(hm, mn, sizeof(mn));
+                            plog("[overlay]   slot %d -> %08X (%s +%X)", s2, vt[s2], strrchr(mn, 92) ? strrchr(mn, 92) + 1 : mn, vt[s2] - (DWORD)hm);
+                        }
+                        {
+                            void *q = NULL;
+                            HRESULT hr = ((IUnknown *)p[0x584 / 4])->lpVtbl->QueryInterface((IUnknown *)p[0x584 / 4], &g_iid_dev9, &q);
+                            plog("[overlay]   QueryInterface(IDirect3DDevice9) = %08X, %p", hr, q);
+                            if (q) ((IUnknown *)q)->lpVtbl->Release((IUnknown *)q);
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) { plog("[overlay]   fault reading it"); }
+                    if (!dev && cands <= 4)
+                        plog("[overlay] renderer %p: +0x584 = %08X (vtable %08X), +0x718 = %08X; d3d9 %08X-%08X", p, p[0x584 / 4],
+                             p[0x584 / 4] > 0x10000 && !IsBadReadPtr((void *)p[0x584 / 4], 4) ? *(DWORD *)p[0x584 / 4] : 0, p[0x718 / 4], d0, d1);
+                }
+                if (dev) break;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+    if (!dev) { plog("[overlay] the game's Direct3D device was not found (%d renderer candidates, %lu ms) - no overlay", cands, GetTickCount() - t0); return; }
+    {
+        void **src = *(void ***)dev;
+        int z;
+        for (z = 0; z < 256 && !IsBadReadPtr(src + z, 4); z++) g_ov_vt[z] = src[z];
+    }
+    o_present = (fn_present)g_ov_vt[17];
+    {
+        int z, nz = 0;
+        for (z = 0; z < 119; z++) if (!g_ov_vt[z]) nz++;
+        plog("[overlay] device vtable %p: Present %p, Reset %p, %d empty entries", *(void **)dev, g_ov_vt[17], g_ov_vt[16], nz);
+        if (nz || !o_present) { plog("[overlay] unexpected vtable - not hooked"); return; }
+    }
+    g_ov_vt[17] = (void *)hook_present;
+    *(void ***)dev = g_ov_vt;
+    g_ov_dev = dev;
+    plog("[overlay] Direct3D device %p found (%d renderer candidates, %lu ms), Present hooked", dev, cands, GetTickCount() - t0);
+}
+
+static int ov_make_font(IDirect3DDevice9 *dev, int h)
+{
+    HDC dc = CreateCompatibleDC(NULL);
+    BITMAPINFO bi;
+    DWORD *bits = NULL;
+    HBITMAP bm;
+    HFONT f;
+    TEXTMETRICA tm;
+    D3DLOCKED_RECT lr;
+    int x = 1, y = 1, c, i, j;
+    if (!dc) return 0;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = OV_TEX; bi.bmiHeader.biHeight = -OV_TEX;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&bits, NULL, 0);
+    f = CreateFontA(-h, 0, 0, 0, FW_BOLD, 0, 0, 0, ANSI_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    ANTIALIASED_QUALITY, DEFAULT_PITCH, "Arial");
+    if (!bm || !f || !bits) { if (bm) DeleteObject(bm); if (f) DeleteObject(f); DeleteDC(dc); return 0; }
+    SelectObject(dc, bm); SelectObject(dc, f);
+    memset(bits, 0, OV_TEX * OV_TEX * 4);
+    SetTextColor(dc, RGB(255, 255, 255)); SetBkColor(dc, RGB(0, 0, 0)); SetBkMode(dc, OPAQUE);
+    GetTextMetricsA(dc, &tm);
+    g_ov_line_h = tm.tmHeight;
+    for (c = 32; c < 127; c++) {
+        char ch = (char)c;
+        SIZE s;
+        GetTextExtentPoint32A(dc, &ch, 1, &s);
+        if (x + s.cx + 2 > OV_TEX) { x = 1; y += tm.tmHeight + 2; }
+        if (y + tm.tmHeight + 1 > OV_TEX) break;
+        TextOutA(dc, x, y, &ch, 1);
+        g_ov_u[c - 32] = (float)x / OV_TEX; g_ov_v[c - 32] = (float)y / OV_TEX; g_ov_cw[c - 32] = s.cx;
+        x += s.cx + 2;
+    }
+    GdiFlush();
+    if (g_ov_tex) { g_ov_tex->lpVtbl->Release(g_ov_tex); g_ov_tex = NULL; }
+    if (dev->lpVtbl->CreateTexture(dev, OV_TEX, OV_TEX, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &g_ov_tex, NULL) != D3D_OK) g_ov_tex = NULL;
+    if (g_ov_tex && g_ov_tex->lpVtbl->LockRect(g_ov_tex, 0, &lr, NULL, 0) == D3D_OK) {
+        for (j = 0; j < OV_TEX; j++) {
+            DWORD *dst = (DWORD *)((BYTE *)lr.pBits + j * lr.Pitch), *src = bits + j * OV_TEX;
+            for (i = 0; i < OV_TEX; i++) dst[i] = ((src[i] & 0xFF) << 24) | 0x00FFFFFF;
+        }
+        g_ov_tex->lpVtbl->UnlockRect(g_ov_tex, 0);
+    }
+    DeleteObject(f); DeleteObject(bm); DeleteDC(dc);
+    plog("[overlay] font %d px (line %d px) %s", h, g_ov_line_h, g_ov_tex ? "ready" : "texture FAILED");
+    return g_ov_tex != NULL;
+}
+
+struct ov_v { float x, y, z, rhw; DWORD c; float u, v; };
+static struct ov_v g_ov_vb[6 * 2600];
+static int g_ov_nv;
+static void ov_quad(float x0, float y0, float x1, float y1, DWORD c, float u0, float v0, float u1, float v1)
+{
+    struct ov_v *v = g_ov_vb + g_ov_nv;
+    if (g_ov_nv + 6 > (int)(sizeof(g_ov_vb) / sizeof(g_ov_vb[0]))) return;
+    x0 -= 0.5f; y0 -= 0.5f; x1 -= 0.5f; y1 -= 0.5f;
+    v[0].x = x0; v[0].y = y0; v[0].u = u0; v[0].v = v0;
+    v[1].x = x1; v[1].y = y0; v[1].u = u1; v[1].v = v0;
+    v[2].x = x0; v[2].y = y1; v[2].u = u0; v[2].v = v1;
+    v[3] = v[2]; v[4] = v[1];
+    v[5].x = x1; v[5].y = y1; v[5].u = u1; v[5].v = v1;
+    { int i; for (i = 0; i < 6; i++) { v[i].z = 0; v[i].rhw = 1; v[i].c = c; } }
+    g_ov_nv += 6;
+}
+static int ov_text_w(const char *s)
+{
+    int w = 0;
+    for (; *s; s++) { int c = (unsigned char)*s; if (c >= 32 && c < 127) w += g_ov_cw[c - 32]; }
+    return w;
+}
+static void ov_text(float x, float y, const char *s, DWORD col)
+{
+    for (; *s; s++) {
+        int c = (unsigned char)*s;
+        float w;
+        if (c < 32 || c >= 127) c = '?';
+        w = (float)g_ov_cw[c - 32];
+        ov_quad(x, y, x + w, y + g_ov_line_h, col, g_ov_u[c - 32], g_ov_v[c - 32],
+                g_ov_u[c - 32] + w / OV_TEX, g_ov_v[c - 32] + (float)g_ov_line_h / OV_TEX);
+        x += w;
+    }
+}
+
+static void ov_draw(IDirect3DDevice9 *dev)
+{
+    static struct ov_line menu[OV_MENU_MAX], down[3];
+    IDirect3DSurface9 *bb = NULL;
+    IDirect3DStateBlock9 *sb = NULL;
+    D3DSURFACE_DESC sd;
+    int nm, nd, i, h, ntext_start, maxw = 0;
+    float W, H, lh, x0, y0;
+    if (dev->lpVtbl->TestCooperativeLevel(dev) != D3D_OK) return;
+    ov_lock();
+    nm = g_ov_menu_n; nd = g_ov_down_n;
+    memcpy(menu, g_ov_menu, sizeof(menu)); memcpy(down, g_ov_down, sizeof(down));
+    ov_unlock();
+    if (dev->lpVtbl->GetBackBuffer(dev, 0, 0, D3DBACKBUFFER_TYPE_MONO, &bb) != D3D_OK || !bb) return;
+    bb->lpVtbl->GetDesc(bb, &sd);
+    bb->lpVtbl->Release(bb);
+    W = (float)sd.Width; H = (float)sd.Height;
+    h = (int)(H / 36); if (h < 12) h = 12; if (h > 40) h = 40;
+    if (h != g_ov_font_h || !g_ov_tex) { g_ov_font_h = h; if (!ov_make_font(dev, h)) return; }
+    lh = g_ov_line_h * 1.2f;
+    g_ov_nv = 0;
+    /* backgrounds first (untextured), then the text */
+    for (i = 0; i < nm; i++) { int w = ov_text_w(menu[i].text); if (w > maxw) maxw = w; }
+    x0 = (W - maxw) / 2; y0 = H * 0.16f;
+    if (nm) ov_quad(x0 - h, y0 - h * 0.6f, x0 + maxw + h, y0 + nm * lh + h * 0.4f, 0xC0000000, 0, 0, 0, 0);
+    for (i = 0; i < nd; i++) {
+        int w = ov_text_w(down[i].text);
+        float yy = H * 0.07f + i * lh;
+        ov_quad((W - w) / 2 - h * 0.5f, yy - 2, (W + w) / 2 + h * 0.5f, yy + g_ov_line_h + 2, 0xA0000000, 0, 0, 0, 0);
+    }
+    ntext_start = g_ov_nv;
+    for (i = 0; i < nm; i++) ov_text(x0, y0 + i * lh, menu[i].text, menu[i].color);
+    for (i = 0; i < nd; i++) ov_text((W - ov_text_w(down[i].text)) / 2, H * 0.07f + i * lh, down[i].text, down[i].color);
+    if (dev->lpVtbl->CreateStateBlock(dev, D3DSBT_ALL, &sb) != D3D_OK) sb = NULL;
+    if (dev->lpVtbl->BeginScene(dev) == D3D_OK) {
+        dev->lpVtbl->SetVertexShader(dev, NULL);
+        dev->lpVtbl->SetPixelShader(dev, NULL);
+        dev->lpVtbl->SetFVF(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ZENABLE, FALSE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ZWRITEENABLE, FALSE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_LIGHTING, FALSE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_CULLMODE, D3DCULL_NONE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_FOGENABLE, FALSE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHATESTENABLE, FALSE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_STENCILENABLE, FALSE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_SCISSORTESTENABLE, FALSE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_FILLMODE, D3DFILL_SOLID);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_COLORWRITEENABLE, 0xF);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_SRGBWRITEENABLE, FALSE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_ALPHABLENDENABLE, TRUE);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_BLENDOP, D3DBLENDOP_ADD);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+        dev->lpVtbl->SetRenderState(dev, D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+        dev->lpVtbl->SetTextureStageState(dev, 1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        dev->lpVtbl->SetTextureStageState(dev, 1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_TEXCOORDINDEX, 0);
+        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+        dev->lpVtbl->SetSamplerState(dev, 0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        dev->lpVtbl->SetSamplerState(dev, 0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        dev->lpVtbl->SetSamplerState(dev, 0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        dev->lpVtbl->SetSamplerState(dev, 0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        dev->lpVtbl->SetSamplerState(dev, 0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        /* backgrounds: diffuse only */
+        dev->lpVtbl->SetTexture(dev, 0, NULL);
+        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+        if (ntext_start > 0) dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, ntext_start / 3, g_ov_vb, sizeof(struct ov_v));
+        /* text: font alpha x colour */
+        dev->lpVtbl->SetTexture(dev, 0, (IDirect3DBaseTexture9 *)g_ov_tex);
+        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        dev->lpVtbl->SetTextureStageState(dev, 0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+        if (g_ov_nv > ntext_start)
+            dev->lpVtbl->DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, (g_ov_nv - ntext_start) / 3, g_ov_vb + ntext_start, sizeof(struct ov_v));
+        dev->lpVtbl->EndScene(dev);
+    }
+    if (sb) { sb->lpVtbl->Apply(sb); sb->lpVtbl->Release(sb); }
+    else dev->lpVtbl->SetTexture(dev, 0, NULL);
+}
+
+/* ---------------------------------------------------------------------------------------------------
  * 0.79: co-op settings menu (menu_key, default Insert) and the downed-teammate marker.
- * Drawn with the game's own HUD Lua (DisplayString / DisplayImage, ASCII mode) at positions added to
- * Mods\Bos\Gui\Xml\config-bos-hud.xml (<script><coop_menu_*>, <coop_down_*>). Up/Down pick a line,
+ * 0.80: drawn by the proxy's own overlay (see ov_draw above; 0.79's HUD script text never showed). Up/Down pick a line,
  * Left/Right (or Enter) change it, Enter runs an action, menu_key closes. Every change is the matching
  * chat command: the host runs it at once, a client sends it to the host (CMA1) - the host's game
  * decides everything, exactly as if it had been typed. The host sends its settings every 0.5 s
@@ -7875,6 +8234,7 @@ static char g_down_row[3][120];
 static void menu_reset(void)
 {
     g_menu_open = 0; g_menu_drawn = 0; g_mk_n = 0; g_down_rows = 0;
+    ov_lock(); g_ov_menu_n = 0; g_ov_down_n = 0; ov_unlock();
     memset(g_menu_row, 0, sizeof(g_menu_row)); memset(g_down_row, 0, sizeof(g_down_row));
 }
 
@@ -8001,68 +8361,48 @@ static void lua_text(char *dst, int dn, const char *src)
 }
 
 /* (re)draw one HUD line: style n/s/d/t = normal, selected, dim, title; XML entry coop_<group>_<style><row> */
-static int hud_line(char *code, int cn, const char *group, int row, char style, const char *text)
-{
-    char t[130];
-    lua_text(t, sizeof(t), text);
-    return _snprintf(code, cn,
-        "HideString(\"coop_%s_%d\") DisplayString(\"coop_%s_%d\",0,\"font-text\",[[%s]],true,false,%s,TEXT_ALIGN_LEFT,3600,"
-        "\"config-bos-hud.script.coop_%s_%c%d\",\"config-bos-hud.script.coop_%s_%c%d\") ",
-        group, row, group, row, t[0] ? t : " ", strcmp(group, "menu") ? "ALIGN_CENTER" : "ALIGN_LEFT",
-        group, style, row, group, style, row);
-}
-
 static void menu_draw(int force)
 {
-    static char code[8192];
-    char rows[MENU_ROWS][120], st[MENU_ROWS], val[60];
+    char val[60];
+    struct ov_line rows[MENU_ROWS];
     struct hset_pkt v;
     BYTE *net = kt_net();
-    int i, n = 0, any = 0;
+    int i;
+    (void)force;
     menu_values(&v);
-    _snprintf(rows[0], 120, "CO-OP SETTINGS  -  %s", net && net[0xDA4] == 1 ? "you are the host"
-              : "changes are sent to the host"); st[0] = 't';
+    _snprintf(rows[0].text, 120, "CO-OP SETTINGS  -  %s", net && net[0xDA4] == 1 ? "you are the host"
+              : "changes are sent to the host");
+    rows[0].color = 0xFFFFC83C;
     for (i = 0; i < MI_N; i++) {
         int sel = i == g_menu_sel;
         if (i < MI_GIVEUP) {
             menu_value_text(i, &v, val, sizeof(val));
-            _snprintf(rows[i + 1], 120, sel ? "> %s:   <  %s  >" : "   %s:   %s", g_mi_label[i], val);
+            _snprintf(rows[i + 1].text, 120, sel ? "> %s:   <  %s  >" : "   %s:   %s", g_mi_label[i], val);
         } else if (i == MI_RESTART && g_menu_confirm && GetTickCount() - g_menu_confirm < 3000)
-            _snprintf(rows[i + 1], 120, "> Restart the level: press Enter again");
+            _snprintf(rows[i + 1].text, 120, "> Restart the level: press Enter again");
         else
-            _snprintf(rows[i + 1], 120, sel ? "> %s" : "   %s", g_mi_label[i]);
-        rows[i + 1][119] = 0;
-        st[i + 1] = sel ? 's' : 'n';
+            _snprintf(rows[i + 1].text, 120, sel ? "> %s" : "   %s", g_mi_label[i]);
+        rows[i + 1].text[119] = 0;
+        rows[i + 1].color = sel ? 0xFFFF9900 : 0xFFEBEBEB;
     }
-    _snprintf(rows[MI_N + 1], 120, "Up/Down: pick   Left/Right: change   Enter: do it   %s: close",
+    _snprintf(rows[MI_N + 1].text, 120, "Up/Down: pick   Left/Right: change   Enter: do it   %s: close",
               g_menu_key == VK_INSERT ? "Insert" : "menu key");
-    st[MI_N + 1] = 'd';
-    if (!g_menu_drawn || force) {
-        memset(g_menu_row, 0, sizeof(g_menu_row));
-        any = 1;
+    rows[MI_N + 1].color = 0xFFAAAAAA;
+    ov_lock();
+    memcpy(g_ov_menu, rows, sizeof(rows));
+    g_ov_menu_n = MENU_ROWS;
+    ov_unlock();
+    if (!g_menu_drawn) {
+        g_menu_drawn = 1;
+        if (!g_ov_dev) plog("[menu] no overlay (Direct3D device not hooked) - the menu cannot be shown");
     }
-    for (i = 0; i < MENU_ROWS && n > 0 && n < (int)sizeof(code) - 400; i++) {
-        if (!strcmp(rows[i], g_menu_row[i]) && st[i] == g_menu_style[i]) continue;
-        n += hud_line(code + n, sizeof(code) - n, "menu", i, st[i], rows[i]);
-        strcpy(g_menu_row[i], rows[i]); g_menu_style[i] = st[i];
-        any = 1;
-    }
-    if (!any || n <= 0) return;
-    if (lua_run("coop menu", code, 1) != 0) {
-        plog("[menu] the HUD draw failed - menu closed (is Mods\\Bos\\Gui\\Xml\\config-bos-hud.xml the co-op one?)");
-        g_menu_open = 0;
-    }
-    g_menu_drawn = 1;
 }
 
 static void menu_close(void)
 {
-    char code[3000];
-    int i, n = 0;
-    for (i = 0; i < MENU_ROWS && n > 0; i++) n += _snprintf(code + n, sizeof(code) - n, "HideString(\"coop_menu_%d\") ", i);
-    lua_run("coop menu close", code, 1);
+    ov_lock(); g_ov_menu_n = 0; ov_unlock();
     g_menu_open = 0; g_menu_drawn = 0;
-    memset(g_menu_row, 0, sizeof(g_menu_row));
+    plog("[menu] closed");
 }
 
 /* downed teammates: minimap icon + top-of-screen line, on every PC from its own simulation */
@@ -8072,11 +8412,12 @@ static void marker_tick(void)
     struct rv_scan sc;
     struct hset_pkt v;
     BYTE *iface = *(BYTE **)VA(VA_ENGINE_IFACE), *lc = (BYTE *)local_character();
-    char code[3000], lines[3][120], nm[70];
+    char code[3000], nm[70];
+    struct ov_line lines[3];
     float me[3] = { 0, 0, 0 };
     int i, j, n = 0, nl = 0;
     DWORD now = GetTickCount();
-    if (!iface || now - last < 500) return;
+    if (!iface || now - last < 250) return;
     last = now;
     menu_values(&v);
     memset(&sc, 0, sizeof(sc));
@@ -8097,28 +8438,23 @@ static void marker_tick(void)
             plog("[revive] minimap marker %s for %s", down ? "on" : "off", c->name);
         }
         if (down && nl < 3) {
+            lines[nl].color = 0xFFFF5A3C;
             if (mine)
-                _snprintf(lines[nl], 120, "You are down - a teammate can revive you. Hold Space 1 s (or Insert > Give up) to respawn");
+                _snprintf(lines[nl].text, 120, "You are down - a teammate can revive you.  Hold Space 1 s (or Insert > Give up) to respawn");
             else {
                 float dx = c->pos[0] - me[0], dy = c->pos[1] - me[1], dz = c->pos[2] - me[2];
                 float d = (float)sqrt(dx * dx + dy * dy + dz * dz), r = v.radius10 / 10.0f;
-                if (d <= r) _snprintf(lines[nl], 120, "%s is down - IN REVIVE RANGE, stay close", nm);
-                else _snprintf(lines[nl], 120, "%s is down - distance %.0f (revive range %.0f), see the minimap", nm, d, r);
+                if (d <= r) { _snprintf(lines[nl].text, 120, "%s is down - IN REVIVE RANGE, stay close", nm); lines[nl].color = 0xFF50FF50; }
+                else _snprintf(lines[nl].text, 120, "%s is down - distance %.0f (revive range %.0f)", nm, d, r);
             }
-            lines[nl][119] = 0;
+            lines[nl].text[119] = 0;
             nl++;
         }
     }
-    for (i = 0; i < 3 && n >= 0 && n < (int)sizeof(code) - 400; i++) {
-        if (i < nl) {
-            if (!strcmp(lines[i], g_down_row[i])) continue;
-            n += hud_line(code + n, sizeof(code) - n, "down", i, 'n', lines[i]);
-            strcpy(g_down_row[i], lines[i]);
-        } else if (g_down_row[i][0]) {
-            n += _snprintf(code + n, sizeof(code) - n, "HideString(\"coop_down_%d\") ", i);
-            g_down_row[i][0] = 0;
-        }
-    }
+    ov_lock();
+    memcpy(g_ov_down, lines, nl * sizeof(lines[0]));
+    g_ov_down_n = nl;
+    ov_unlock();
     if (n > 0) lua_run("coop revive marker", code, 1);
 }
 
@@ -8131,6 +8467,7 @@ static void menu_tick(void)
     DWORD pid = 0, now = GetTickCount();
     int fg;
     if (!net || !g_mission_started) return;
+    ov_install();
     if (net[0xDA4] == 1 && now - hs_sent >= 500) {           /* host: settings for the clients' menus */
         struct hset_pkt p;
         hs_sent = now;
@@ -8377,6 +8714,7 @@ static void load_config(void)
             g_rv_marker = GetPrivateProfileIntA("proxy", "revive_marker", 2, path);
             g_menu_on = GetPrivateProfileIntA("proxy", "menu", 1, path);
             g_menu_key = GetPrivateProfileIntA("proxy", "menu_key", VK_INSERT, path);
+            g_ov_test = GetPrivateProfileIntA("proxy", "overlay_test", 0, path);
         }
         if (g_champions < 1 || g_champions > 3) g_champions = 1;
     }
@@ -8571,6 +8909,25 @@ void __cdecl trace_export(int idx, DWORD *esp)
     }
     if (idx == g_idx_render)
         run_state_watch();
+    static DWORD ov_t0;
+    if (idx == g_idx_render && g_ov_test && !ov_t0) ov_t0 = GetTickCount();
+    static int ov_reported;
+    if (idx == g_idx_render && g_ov_test && g_ov_tried && !ov_reported && GetTickCount() - ov_t0 > 25000) {
+        ov_reported = 1;
+        plog("[overlay] test: %ld frames presented through the hook, device vtable %s", g_ov_presents,
+             g_ov_dev && *(void **)g_ov_dev == (void *)g_ov_vt ? "still ours" : "CHANGED by someone");
+    }
+    if (idx == g_idx_render && g_ov_test && !g_ov_tried && GetTickCount() - ov_t0 > 8000) {
+        ov_install();
+        ov_lock();
+        strcpy(g_ov_down[0].text, "CoopMod overlay test - the co-op menu and revive lines are drawn like this");
+        g_ov_down[0].color = 0xFF50FF50;
+        strcpy(g_ov_menu[0].text, "CO-OP SETTINGS  -  test"); g_ov_menu[0].color = 0xFFFFC83C;
+        strcpy(g_ov_menu[1].text, "> Difficulty:   <  impossible (x8)  >"); g_ov_menu[1].color = 0xFFFF9900;
+        strcpy(g_ov_menu[2].text, "   Revive range:   30"); g_ov_menu[2].color = 0xFFEBEBEB;
+        g_ov_down_n = 1; g_ov_menu_n = 3;
+        ov_unlock();
+    }
     if (idx == g_idx_update_sim && g_mission_pending && GetTickCount() >= g_mission_pending_at) {
         g_mission_pending = 0;
         g_mission_started = 1;
