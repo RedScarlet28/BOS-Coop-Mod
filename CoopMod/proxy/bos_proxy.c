@@ -31,7 +31,7 @@
 #include <ctype.h>
 #include <math.h>
 
-#define COOPMOD_VERSION "CoopMod proxy 0.78"
+#define COOPMOD_VERSION "CoopMod proxy 0.79"
 #define BOS_PREFERRED_BASE 0x10000000u
 
 static HMODULE g_self;
@@ -2207,6 +2207,7 @@ static void merc_watch(void)
 
 static void lives_tick(void);
 static void lives_reset(void);
+static void menu_reset(void);
 static void coop_tick(void)
 {
     BYTE *game = bos_game(), *cam;
@@ -4640,6 +4641,13 @@ struct frz_pkt { DWORD magic; int frame; WORD n, last; struct frz_rec r[FRZ_PER_
 struct tp_rec { DWORD id; float x, y, z; };
 struct tp_pkt { DWORD magic; int frame; WORD n, last; struct tp_rec r[TP_PER_FRAME]; };
 struct giveup_pkt { DWORD magic; char name[60]; };
+#define NPC_MAGIC_ADMIN 0x31414D43u       /* "CMA1" client -> master: a co-op menu command from <name> (0.79) */
+#define NPC_MAGIC_HSET  0x31484D43u       /* "CMH1" master -> clients: the host's settings for the menu (0.79) */
+struct admin_pkt { DWORD magic; char name[60]; char text[124]; };
+struct hset_pkt { DWORD magic; LONG revive, time10, radius10, bleed, lives, lives_act, wipe_act, champions, diff; };
+static struct hset_pkt g_hs;
+static volatile LONG g_hs_ok;
+static void admin_from_client(const char *name, const char *text);
 #define NPC_MAGIC_DIFF   0x31564D43u      /* "CMV1" master -> client: difficulty level (0.75) */
 static int g_difficulty;
 static volatile LONG g_diff_rx = -1;
@@ -4865,11 +4873,27 @@ static int npc_on_packet(SOCKET s, const char *buf, int len, const struct sockad
     if (len < 4) return 0;
     magic = *(const DWORD *)buf;
     if (magic != NPC_MAGIC_CMD && magic != NPC_MAGIC_DRV && magic != NPC_MAGIC_HELLO && magic != NPC_MAGIC_FRZ &&
-        magic != NPC_MAGIC_STATE && magic != NPC_MAGIC_TP && magic != NPC_MAGIC_GIVEUP && magic != NPC_MAGIC_DIFF) return 0;
+        magic != NPC_MAGIC_STATE && magic != NPC_MAGIC_TP && magic != NPC_MAGIC_GIVEUP && magic != NPC_MAGIC_DIFF &&
+        magic != NPC_MAGIC_ADMIN && magic != NPC_MAGIC_HSET) return 0;
     if (!g_net_npc_commands || !(net = kt_net())) return 1;
     now = GetTickCount();
     if (magic == NPC_MAGIC_DIFF) {
         if (net[0xDA4] == 0 && len >= 8) InterlockedExchange(&g_diff_rx, *(const LONG *)(buf + 4));
+        return 1;
+    }
+    if (magic == NPC_MAGIC_ADMIN) {
+        char nm[61], tx[125];
+        const struct admin_pkt *ap = (const struct admin_pkt *)buf;
+        if (net[0xDA4] != 1 || len < (int)sizeof(struct admin_pkt)) return 1;
+        memcpy(nm, ap->name, 60); nm[60] = 0;
+        memcpy(tx, ap->text, 124); tx[124] = 0;
+        admin_from_client(nm, tx);
+        return 1;
+    }
+    if (magic == NPC_MAGIC_HSET) {
+        if (net[0xDA4] != 0 || len < (int)sizeof(struct hset_pkt)) return 1;
+        memcpy(&g_hs, buf, sizeof(g_hs));
+        InterlockedExchange(&g_hs_ok, 1);
         return 1;
     }
     if (magic == NPC_MAGIC_GIVEUP) {
@@ -6770,6 +6794,7 @@ static void lives_reset(void)
     g_lives_used = g_lives_fired = g_wipe_fired = 0;
     g_lv_n = 0;
     g_rv_n = 0;
+    menu_reset();
 }
 /* 0.71: with revive on, a life is used when a downed player is let go (gave up / bled out), not at the death */
 static void lives_lose(const char *name, const char *why)
@@ -6904,7 +6929,7 @@ static void lives_save(void)
  * coop_config.ini [proxy] revive=1, revive_time=4, revive_radius=12 (game units), revive_bleedout=90 (0 = never),
  * revive_key=32 (virtual key, 0 = off).
  */
-static float g_rv_time = 4.0f, g_rv_radius = 12.0f;   /* game units: the eye is ~7 above the feet (0.71 log) */
+static float g_rv_time = 4.0f, g_rv_radius = 30.0f;   /* 0.79: 12 -> 30 */   /* game units: the eye is ~7 above the feet (0.71 log) */
 static int g_rv_bleed = 90, g_rv_key = VK_SPACE;
 enum { RV_NONE = 0, RV_DOWN, RV_FREE };
 static struct rv {
@@ -7815,6 +7840,343 @@ static void kits_char_dump(BYTE *e)
     plog("%s", line);
 }
 
+/* ---------------------------------------------------------------------------------------------------
+ * 0.79: co-op settings menu (menu_key, default Insert) and the downed-teammate marker.
+ * Drawn with the game's own HUD Lua (DisplayString / DisplayImage, ASCII mode) at positions added to
+ * Mods\Bos\Gui\Xml\config-bos-hud.xml (<script><coop_menu_*>, <coop_down_*>). Up/Down pick a line,
+ * Left/Right (or Enter) change it, Enter runs an action, menu_key closes. Every change is the matching
+ * chat command: the host runs it at once, a client sends it to the host (CMA1) - the host's game
+ * decides everything, exactly as if it had been typed. The host sends its settings every 0.5 s
+ * (CMH1) so a client's menu shows the host's values.
+ * Marker: a downed teammate is tracked on the minimap (MiniMapTrack, revive_marker = icon type,
+ * 0 = off) and a line at the top of the screen gives the distance and the revive range.
+ * ------------------------------------------------------------------------------------------------- */
+static int g_menu_on = 1, g_menu_key = VK_INSERT, g_rv_marker = 2;
+enum { MI_DIFF, MI_REVIVE, MI_RTIME, MI_RRAD, MI_RBLEED, MI_LIVES, MI_LACT, MI_WIPE, MI_CHAMP,
+       MI_GIVEUP, MI_FWD, MI_GOTO, MI_BRING, MI_RESTART, MI_CLOSE, MI_N };
+#define MENU_ROWS (MI_N + 2)                     /* title + items + footer */
+static const char *g_mi_label[MI_N] = { "Difficulty", "Revive", "Revive time", "Revive range", "Bleed-out",
+    "Party lives", "Lives run out", "Everyone down", "Champions per fight",
+    "Give up (respawn now)", "Unstuck: step forward", "Teleport to the other player", "Bring everyone to me",
+    "Restart the level", "Close" };
+static const float g_mv_time[] = { 2, 3, 4, 5, 6, 8, 10, 15 };
+static const float g_mv_rad[] = { 8, 12, 16, 20, 25, 30, 40, 50, 70, 100 };
+static const int g_mv_bleed[] = { 0, 30, 60, 90, 120, 180, 300 };
+static const int g_mv_lives[] = { 0, 1, 3, 5, 10, 20, 50 };
+static int g_menu_open, g_menu_sel, g_menu_drawn;
+static DWORD g_menu_confirm;
+static char g_menu_row[MENU_ROWS][120];
+static char g_menu_style[MENU_ROWS];
+struct mk { char name[64]; int tracked, shown; };
+static struct mk g_mk[8];
+static int g_mk_n, g_down_rows;
+static char g_down_row[3][120];
+
+static void menu_reset(void)
+{
+    g_menu_open = 0; g_menu_drawn = 0; g_mk_n = 0; g_down_rows = 0;
+    memset(g_menu_row, 0, sizeof(g_menu_row)); memset(g_down_row, 0, sizeof(g_down_row));
+}
+
+static int key_edge(int vk, int *was)
+{
+    int d = (GetAsyncKeyState(vk) & 0x8000) != 0, r = d && !*was;
+    *was = d;
+    return r;
+}
+
+/* the host runs it, a client asks the host */
+static void menu_cmd(const char *text)
+{
+    BYTE *net = kt_net();
+    BYTE *lc = (BYTE *)local_character();
+    plog("[menu] %s", text);
+    if (!net) return;
+    if (net[0xDA4] == 1) {
+        struct admin_ctx c;
+        if (!chat_ctx_default(&c)) memset(&c, 0, sizeof(c));
+        admin_enqueue(text, "", 1, &c);
+        return;
+    }
+    if (g_npc_master_s != INVALID_SOCKET && o_sendto) {
+        struct admin_pkt p;
+        memset(&p, 0, sizeof(p));
+        p.magic = NPC_MAGIC_ADMIN;
+        __try { if (lc) strncpy(p.name, entity_name(lc), sizeof(p.name) - 1); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        strncpy(p.text, text, sizeof(p.text) - 1);
+        o_sendto(g_npc_master_s, (const char *)&p, (int)sizeof(p), 0, (const struct sockaddr *)&g_npc_master, sizeof(g_npc_master));
+    }
+}
+
+/* host: a client's menu command (network thread) */
+static void admin_from_client(const char *name, const char *text)
+{
+    struct admin_ctx c;
+    if (!g_admin || (text[0] != '/' && text[0] != '!')) return;
+    if (!g_admin_clients) { plog("[menu] %s: %s - ignored (admin_clients=0)", name, text); return; }
+    plog("[menu] from %s: %s", name, text);
+    if (!chat_ctx_default(&c)) memset(&c, 0, sizeof(c));
+    admin_enqueue(text, name, 0, &c);
+}
+
+/* the values the menu shows: the host's own, or what the host last sent */
+static void menu_values(struct hset_pkt *v)
+{
+    BYTE *net = kt_net();
+    if (net && net[0xDA4] == 0 && g_hs_ok) { *v = g_hs; return; }
+    v->revive = g_revive; v->time10 = (LONG)(g_rv_time * 10 + 0.5f); v->radius10 = (LONG)(g_rv_radius * 10 + 0.5f);
+    v->bleed = g_rv_bleed; v->lives = g_party_lives; v->lives_act = g_lives_action; v->wipe_act = g_wipe_action;
+    v->champions = g_champions; v->diff = g_difficulty;
+}
+
+static int nearest_f(const float *a, int n, float x)
+{
+    int i, b = 0;
+    for (i = 1; i < n; i++) if (fabs(a[i] - x) < fabs(a[b] - x)) b = i;
+    return b;
+}
+static int nearest_i(const int *a, int n, int x)
+{
+    int i, b = 0;
+    for (i = 1; i < n; i++) if (abs(a[i] - x) < abs(a[b] - x)) b = i;
+    return b;
+}
+#define NA(a) ((int)(sizeof(a) / sizeof(a[0])))
+
+static void menu_value_text(int i, const struct hset_pkt *v, char *o, int on)
+{
+    o[0] = 0;
+    switch (i) {
+    case MI_DIFF: if (v->diff >= 0 && v->diff < DIFF_N) _snprintf(o, on, "%s (x%g)", g_diff_names[v->diff], g_diff_factor[v->diff]); break;
+    case MI_REVIVE: _snprintf(o, on, "%s", v->revive ? "on" : "off"); break;
+    case MI_RTIME: _snprintf(o, on, "%g s", v->time10 / 10.0); break;
+    case MI_RRAD: _snprintf(o, on, "%g", v->radius10 / 10.0); break;
+    case MI_RBLEED: if (v->bleed > 0) _snprintf(o, on, "%d s", (int)v->bleed); else _snprintf(o, on, "never"); break;
+    case MI_LIVES: if (v->lives > 0) _snprintf(o, on, "%d", (int)v->lives); else _snprintf(o, on, "unlimited"); break;
+    case MI_LACT: _snprintf(o, on, "%s", v->lives_act == ACT_RESTART ? "restart the level" : "just warn"); break;
+    case MI_WIPE: _snprintf(o, on, "%s", v->wipe_act == ACT_RESTART ? "restart the level" : v->wipe_act == ACT_OFF ? "nothing" : "warn"); break;
+    case MI_CHAMP: _snprintf(o, on, "%d", (int)v->champions); break;
+    }
+    o[on - 1] = 0;
+}
+
+/* Left (-1) / Right (+1) on a setting: the command for the next value */
+static int menu_step(int i, int d, const struct hset_pkt *v, char *cmd, int cn)
+{
+    int k;
+    cmd[0] = 0;
+    switch (i) {
+    case MI_DIFF: k = v->diff + d; if (k < 0) k = 0; if (k >= DIFF_N) k = DIFF_N - 1;
+        if (k == v->diff) return 0; _snprintf(cmd, cn, "/difficulty %s", g_diff_names[k]); break;
+    case MI_REVIVE: _snprintf(cmd, cn, "/revive %s", v->revive ? "off" : "on"); break;
+    case MI_RTIME: k = nearest_f(g_mv_time, NA(g_mv_time), v->time10 / 10.0f) + d; if (k < 0 || k >= NA(g_mv_time)) return 0;
+        _snprintf(cmd, cn, "/revive time %g", g_mv_time[k]); break;
+    case MI_RRAD: k = nearest_f(g_mv_rad, NA(g_mv_rad), v->radius10 / 10.0f) + d; if (k < 0 || k >= NA(g_mv_rad)) return 0;
+        _snprintf(cmd, cn, "/revive radius %g", g_mv_rad[k]); break;
+    case MI_RBLEED: k = nearest_i(g_mv_bleed, NA(g_mv_bleed), v->bleed) + d; if (k < 0 || k >= NA(g_mv_bleed)) return 0;
+        _snprintf(cmd, cn, "/revive bleed %d", g_mv_bleed[k]); break;
+    case MI_LIVES: k = nearest_i(g_mv_lives, NA(g_mv_lives), v->lives) + d; if (k < 0 || k >= NA(g_mv_lives)) return 0;
+        if (g_mv_lives[k]) _snprintf(cmd, cn, "/lives %d", g_mv_lives[k]); else _snprintf(cmd, cn, "/lives off"); break;
+    case MI_LACT: _snprintf(cmd, cn, "/lives %s", v->lives_act == ACT_RESTART ? "warn" : "restart"); break;
+    case MI_WIPE: { static const int order[3] = { ACT_OFF, ACT_WARN, ACT_RESTART };
+        for (k = 0; k < 3 && order[k] != v->wipe_act; k++) {}
+        k = (k >= 3 ? 0 : k) + d; if (k < 0 || k > 2) return 0;
+        _snprintf(cmd, cn, "/wipe %s", g_act_names[order[k]]); break; }
+    case MI_CHAMP: k = v->champions + d; if (k < 1 || k > 3) return 0; _snprintf(cmd, cn, "/champions %d", k); break;
+    default: return 0;
+    }
+    cmd[cn - 1] = 0;
+    return 1;
+}
+
+static void lua_text(char *dst, int dn, const char *src)
+{
+    int i, j = 0;
+    for (i = 0; src[i] && j < dn - 1; i++) {
+        char ch = src[i];
+        if (ch == ']' || ch == '[' || (unsigned char)ch < 32) ch = ' ';
+        dst[j++] = ch;
+    }
+    dst[j] = 0;
+}
+
+/* (re)draw one HUD line: style n/s/d/t = normal, selected, dim, title; XML entry coop_<group>_<style><row> */
+static int hud_line(char *code, int cn, const char *group, int row, char style, const char *text)
+{
+    char t[130];
+    lua_text(t, sizeof(t), text);
+    return _snprintf(code, cn,
+        "HideString(\"coop_%s_%d\") DisplayString(\"coop_%s_%d\",0,\"font-text\",[[%s]],true,false,%s,TEXT_ALIGN_LEFT,3600,"
+        "\"config-bos-hud.script.coop_%s_%c%d\",\"config-bos-hud.script.coop_%s_%c%d\") ",
+        group, row, group, row, t[0] ? t : " ", strcmp(group, "menu") ? "ALIGN_CENTER" : "ALIGN_LEFT",
+        group, style, row, group, style, row);
+}
+
+static void menu_draw(int force)
+{
+    static char code[8192];
+    char rows[MENU_ROWS][120], st[MENU_ROWS], val[60];
+    struct hset_pkt v;
+    BYTE *net = kt_net();
+    int i, n = 0, any = 0;
+    menu_values(&v);
+    _snprintf(rows[0], 120, "CO-OP SETTINGS  -  %s", net && net[0xDA4] == 1 ? "you are the host"
+              : "changes are sent to the host"); st[0] = 't';
+    for (i = 0; i < MI_N; i++) {
+        int sel = i == g_menu_sel;
+        if (i < MI_GIVEUP) {
+            menu_value_text(i, &v, val, sizeof(val));
+            _snprintf(rows[i + 1], 120, sel ? "> %s:   <  %s  >" : "   %s:   %s", g_mi_label[i], val);
+        } else if (i == MI_RESTART && g_menu_confirm && GetTickCount() - g_menu_confirm < 3000)
+            _snprintf(rows[i + 1], 120, "> Restart the level: press Enter again");
+        else
+            _snprintf(rows[i + 1], 120, sel ? "> %s" : "   %s", g_mi_label[i]);
+        rows[i + 1][119] = 0;
+        st[i + 1] = sel ? 's' : 'n';
+    }
+    _snprintf(rows[MI_N + 1], 120, "Up/Down: pick   Left/Right: change   Enter: do it   %s: close",
+              g_menu_key == VK_INSERT ? "Insert" : "menu key");
+    st[MI_N + 1] = 'd';
+    if (!g_menu_drawn || force) {
+        memset(g_menu_row, 0, sizeof(g_menu_row));
+        any = 1;
+    }
+    for (i = 0; i < MENU_ROWS && n > 0 && n < (int)sizeof(code) - 400; i++) {
+        if (!strcmp(rows[i], g_menu_row[i]) && st[i] == g_menu_style[i]) continue;
+        n += hud_line(code + n, sizeof(code) - n, "menu", i, st[i], rows[i]);
+        strcpy(g_menu_row[i], rows[i]); g_menu_style[i] = st[i];
+        any = 1;
+    }
+    if (!any || n <= 0) return;
+    if (lua_run("coop menu", code, 1) != 0) {
+        plog("[menu] the HUD draw failed - menu closed (is Mods\\Bos\\Gui\\Xml\\config-bos-hud.xml the co-op one?)");
+        g_menu_open = 0;
+    }
+    g_menu_drawn = 1;
+}
+
+static void menu_close(void)
+{
+    char code[3000];
+    int i, n = 0;
+    for (i = 0; i < MENU_ROWS && n > 0; i++) n += _snprintf(code + n, sizeof(code) - n, "HideString(\"coop_menu_%d\") ", i);
+    lua_run("coop menu close", code, 1);
+    g_menu_open = 0; g_menu_drawn = 0;
+    memset(g_menu_row, 0, sizeof(g_menu_row));
+}
+
+/* downed teammates: minimap icon + top-of-screen line, on every PC from its own simulation */
+static void marker_tick(void)
+{
+    static DWORD last;
+    struct rv_scan sc;
+    struct hset_pkt v;
+    BYTE *iface = *(BYTE **)VA(VA_ENGINE_IFACE), *lc = (BYTE *)local_character();
+    char code[3000], lines[3][120], nm[70];
+    float me[3] = { 0, 0, 0 };
+    int i, j, n = 0, nl = 0;
+    DWORD now = GetTickCount();
+    if (!iface || now - last < 500) return;
+    last = now;
+    menu_values(&v);
+    memset(&sc, 0, sizeof(sc));
+    __try { for_each_entity(iface, 5, 1, rv_scan_cb, &sc); if (lc) memcpy(me, lc + 0x174, 12); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    code[0] = 0;
+    for (j = 0; j < sc.n; j++) {
+        struct rv_ch *c = &sc.c[j];
+        struct mk *m = NULL;
+        int mine = c->e == lc, down = !c->alive && v.revive;
+        for (i = 0; i < g_mk_n; i++) if (!strcmp(g_mk[i].name, c->name)) m = &g_mk[i];
+        if (!m && g_mk_n < 8) { m = &g_mk[g_mk_n++]; memset(m, 0, sizeof(*m)); strcpy(m->name, c->name); }
+        if (!m) continue;
+        lua_text(nm, sizeof(nm), c->name);
+        if (!mine && g_rv_marker > 0 && down != m->tracked && n >= 0 && n < (int)sizeof(code) - 200) {
+            n += _snprintf(code + n, sizeof(code) - n, "local e = GetCharacterID([[%s]]) if e ~= nil then MiniMapTrack(e, %d, %s) end ",
+                           nm, g_rv_marker, down ? "true" : "false");
+            m->tracked = down;
+            plog("[revive] minimap marker %s for %s", down ? "on" : "off", c->name);
+        }
+        if (down && nl < 3) {
+            if (mine)
+                _snprintf(lines[nl], 120, "You are down - a teammate can revive you. Hold Space 1 s (or Insert > Give up) to respawn");
+            else {
+                float dx = c->pos[0] - me[0], dy = c->pos[1] - me[1], dz = c->pos[2] - me[2];
+                float d = (float)sqrt(dx * dx + dy * dy + dz * dz), r = v.radius10 / 10.0f;
+                if (d <= r) _snprintf(lines[nl], 120, "%s is down - IN REVIVE RANGE, stay close", nm);
+                else _snprintf(lines[nl], 120, "%s is down - distance %.0f (revive range %.0f), see the minimap", nm, d, r);
+            }
+            lines[nl][119] = 0;
+            nl++;
+        }
+    }
+    for (i = 0; i < 3 && n >= 0 && n < (int)sizeof(code) - 400; i++) {
+        if (i < nl) {
+            if (!strcmp(lines[i], g_down_row[i])) continue;
+            n += hud_line(code + n, sizeof(code) - n, "down", i, 'n', lines[i]);
+            strcpy(g_down_row[i], lines[i]);
+        } else if (g_down_row[i][0]) {
+            n += _snprintf(code + n, sizeof(code) - n, "HideString(\"coop_down_%d\") ", i);
+            g_down_row[i][0] = 0;
+        }
+    }
+    if (n > 0) lua_run("coop revive marker", code, 1);
+}
+
+/* game thread, every simulation update, on every PC */
+static void menu_tick(void)
+{
+    static int k_menu, k_up, k_dn, k_l, k_r, k_ent;
+    static DWORD hs_sent;
+    BYTE *net = kt_net();
+    DWORD pid = 0, now = GetTickCount();
+    int fg;
+    if (!net || !g_mission_started) return;
+    if (net[0xDA4] == 1 && now - hs_sent >= 500) {           /* host: settings for the clients' menus */
+        struct hset_pkt p;
+        hs_sent = now;
+        p.magic = NPC_MAGIC_HSET;
+        p.revive = g_revive; p.time10 = (LONG)(g_rv_time * 10 + 0.5f); p.radius10 = (LONG)(g_rv_radius * 10 + 0.5f);
+        p.bleed = g_rv_bleed; p.lives = g_party_lives; p.lives_act = g_lives_action; p.wipe_act = g_wipe_action;
+        p.champions = g_champions; p.diff = g_difficulty;
+        npc_send_packet(&p, sizeof(p));
+    }
+    marker_tick();
+    if (!g_menu_on || g_menu_key <= 0) return;
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+    fg = pid == GetCurrentProcessId();
+    if (!fg) { k_menu = k_up = k_dn = k_l = k_r = k_ent = 1; return; }  /* no edge from keys pressed elsewhere */
+    if (key_edge(g_menu_key, &k_menu)) {
+        if (g_menu_open) menu_close();
+        else { g_menu_open = 1; g_menu_drawn = 0; g_menu_confirm = 0; plog("[menu] opened"); }
+    }
+    if (!g_menu_open) { key_edge(VK_UP, &k_up); key_edge(VK_DOWN, &k_dn); key_edge(VK_LEFT, &k_l); key_edge(VK_RIGHT, &k_r); key_edge(VK_RETURN, &k_ent); return; }
+    if (key_edge(VK_UP, &k_up)) g_menu_sel = (g_menu_sel + MI_N - 1) % MI_N;
+    if (key_edge(VK_DOWN, &k_dn)) g_menu_sel = (g_menu_sel + 1) % MI_N;
+    {
+        int d = key_edge(VK_LEFT, &k_l) ? -1 : key_edge(VK_RIGHT, &k_r) ? 1 : 0;
+        int ent = key_edge(VK_RETURN, &k_ent);
+        char cmd[96];
+        struct hset_pkt v;
+        menu_values(&v);
+        if (g_menu_sel < MI_GIVEUP) {
+            if ((d || ent) && menu_step(g_menu_sel, d ? d : 1, &v, cmd, sizeof(cmd))) menu_cmd(cmd);
+        } else if (ent) {
+            switch (g_menu_sel) {
+            case MI_GIVEUP: menu_cmd("/giveup"); break;
+            case MI_FWD: menu_cmd("/fwd"); break;
+            case MI_GOTO: menu_cmd("/goto other"); break;
+            case MI_BRING: menu_cmd("/bring all"); break;
+            case MI_RESTART:
+                if (g_menu_confirm && now - g_menu_confirm < 3000) { g_menu_confirm = 0; menu_cmd("/restart"); }
+                else g_menu_confirm = now | 1;
+                break;
+            case MI_CLOSE: menu_close(); return;
+            }
+        }
+    }
+    menu_draw(0);
+}
+
 static void install_admin_hooks(void)
 {
     if (!g_admin) {
@@ -8008,10 +8370,13 @@ static void load_config(void)
             g_coop_kits = GetPrivateProfileIntA("proxy", "coop_kits", 1, path);
             GetPrivateProfileStringA("proxy", "revive_time", "4", w, sizeof(w), path);
             if (atof(w) > 0) g_rv_time = (float)atof(w);
-            GetPrivateProfileStringA("proxy", "revive_radius", "12", w, sizeof(w), path);
+            GetPrivateProfileStringA("proxy", "revive_radius", "30", w, sizeof(w), path);
             if (atof(w) > 0) g_rv_radius = (float)atof(w);
             g_rv_bleed = GetPrivateProfileIntA("proxy", "revive_bleedout", 90, path);
             g_rv_key = GetPrivateProfileIntA("proxy", "revive_key", VK_SPACE, path);
+            g_rv_marker = GetPrivateProfileIntA("proxy", "revive_marker", 2, path);
+            g_menu_on = GetPrivateProfileIntA("proxy", "menu", 1, path);
+            g_menu_key = GetPrivateProfileIntA("proxy", "menu_key", VK_INSERT, path);
         }
         if (g_champions < 1 || g_champions > 3) g_champions = 1;
     }
@@ -8193,6 +8558,7 @@ void __cdecl trace_export(int idx, DWORD *esp)
         coop_tick();
         merc_watch();
         admin_tick();
+        menu_tick();
         if (g_mission_started) bos_arena_watch();
         if (g_mission_started) rb_strip_all("new props");
         ws_dump_host_tick();

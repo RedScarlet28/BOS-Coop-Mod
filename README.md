@@ -13,8 +13,11 @@ both PCs in sync.
   When a level is finished, everyone moves on to the next one together.
 - Enemy and friendly **AI**, mission scripts, objectives, doors and triggers all work for every player.
 - **Champion (BOS) fights**, including more champions per fight for bigger groups (`/champions`).
-- **Revive**: a downed player stays down. A teammate standing next to the body for a few seconds
-  gets them back up. The downed player can give up and respawn at any time (`/giveup` or hold Space).
+- **Revive**: a downed player stays down. A teammate standing near the body for a few seconds
+  gets them back up. The body is marked on the minimap, and a line at the top of the screen shows how far
+  away it is. The downed player can give up and respawn at any time (`/giveup`, or hold Space).
+- **In-game co-op menu** (**Insert**): change difficulty, revive, lives and champions, or use the
+  unstuck/teleport/restart actions, without typing commands. A client's changes are sent to the host.
 - **Party lives**: a shared pool of lives, with an action when it runs out, e.g. restart the
   mission (`/lives`, `/wipe`).
 - **Mission-honest loadouts**: the multiplayer class screen only offers kits built from the
@@ -46,7 +49,8 @@ both PCs in sync.
 - **Host:** Multiplayer → Create (LAN). Pick a `COOP_…` map, e.g. `COOP_Patrol`, the first mission.
 - **Others:** Multiplayer → LAN → join the host's game.
 - Pick a class on the spawn screen. Its kit only contains weapons the current mission allows.
-- Type `/help` and `/help2` in chat to list the commands.
+- Press **Insert** for the co-op menu (Up/Down pick, Left/Right change, Enter runs an action), or type
+  `/help` and `/help2` in chat to list the commands.
 
 | Command | What it does |
 |---|---|

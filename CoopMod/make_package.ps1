@@ -19,6 +19,7 @@ $items = @(
     'coop_config.ini',
     'coop_mission.lua',
     'Mods\Bos\Tuning\Maps.cfg',
+    'Mods\Bos\Gui\Xml\config-bos-hud.xml',
     'Mods\Bos\Tuning\Multiplayer\Coop'
 )
 # every co-op campaign level (COOP_<campaign level>; the numbered COOP_1..8 experiments are left out),
