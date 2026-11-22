@@ -31,7 +31,7 @@
 #include <ctype.h>
 #include <math.h>
 
-#define COOPMOD_VERSION "CoopMod proxy 0.81"
+#define COOPMOD_VERSION "CoopMod proxy 0.82"
 #define BOS_PREFERRED_BASE 0x10000000u
 
 static HMODULE g_self;
@@ -4643,7 +4643,7 @@ struct tp_rec { DWORD id; float x, y, z; };
 struct tp_pkt { DWORD magic; int frame; WORD n, last; struct tp_rec r[TP_PER_FRAME]; };
 struct giveup_pkt { DWORD magic; char name[60]; };
 #define NPC_MAGIC_ADMIN 0x31414D43u       /* "CMA1" client -> master: a co-op menu command from <name> (0.79) */
-#define NPC_MAGIC_HSET  0x31484D43u       /* "CMH1" master -> clients: the host's settings for the menu (0.79) */
+#define NPC_MAGIC_HSET  0x314F4D43u       /* "CMO1" master -> clients: the host's settings for the menu (0.79; was "CMH1" = HELLO until 0.82!) */
 struct admin_pkt { DWORD magic; char name[60]; char text[124]; };
 struct hset_pkt { DWORD magic; LONG revive, time10, radius10, bleed, lives, lives_act, wipe_act, champions, diff; };
 static struct hset_pkt g_hs;
@@ -4865,12 +4865,45 @@ static void __fastcall hook_read_frame_cmds(void *netp, void *edx, int frame)
     net_report();                                     /* also without game traffic (rate-limited) */
 }
 
+/*
+ * Master: remember a client to send the NPC frame table / state / settings to. Until 0.81 only the
+ * client's "hello" did this; since 0.78 no hello reached the host (0 hellos in every 2-PC session,
+ * game traffic fine), so the clients got nothing and re-simulated the AI themselves -> many resyncs.
+ * 0.82: every game datagram from a client also registers it (hello = 1: from a hello packet).
+ */
+static void npc_note_peer(SOCKET s, const struct sockaddr *from, int hello)
+{
+    const struct sockaddr_in *a = (const struct sockaddr_in *)from;
+    DWORD now = GetTickCount();
+    int i, free_i = -1, oldest = 0;
+    if (!a || a->sin_family != AF_INET || a->sin_addr.s_addr == 0x0100007Fu) return;
+    EnterCriticalSection(&g_npc_cs);
+    for (i = 0; i < NPC_PEERS; i++) {
+        if (g_npc_peer[i].seen && g_npc_peer[i].addr.sin_addr.s_addr == a->sin_addr.s_addr &&
+            g_npc_peer[i].addr.sin_port == a->sin_port) break;
+        if (!g_npc_peer[i].seen || now - g_npc_peer[i].seen > 10000) { if (free_i < 0) free_i = i; }
+        else if (g_npc_peer[i].seen < g_npc_peer[oldest].seen) oldest = i;
+    }
+    if (i == NPC_PEERS) {
+        i = free_i >= 0 ? free_i : oldest;
+        g_npc_peer[i].addr = *a;
+        plog("[net] client %u.%u.%u.%u:%u %s - sending it the NPC frame table",
+             a->sin_addr.S_un.S_un_b.s_b1, a->sin_addr.S_un.S_un_b.s_b2, a->sin_addr.S_un.S_un_b.s_b3,
+             a->sin_addr.S_un.S_un_b.s_b4, (WORD)((a->sin_port >> 8) | (a->sin_port << 8)),
+             hello ? "runs the co-op proxy (hello)" : "sends game traffic");
+    }
+    g_npc_peer[i].s = s;
+    g_npc_peer[i].seen = now;
+    LeaveCriticalSection(&g_npc_cs);
+    if (hello) InterlockedIncrement(&g_npc_hellos);
+}
+
 /* hook_recvfrom: 1 = the packet was ours (swallowed) */
 static int npc_on_packet(SOCKET s, const char *buf, int len, const struct sockaddr *from)
 {
     BYTE *net;
     DWORD magic, now;
-    int i, free_i = -1, oldest = 0;
+    int i;
     if (len < 4) return 0;
     magic = *(const DWORD *)buf;
     if (magic != NPC_MAGIC_CMD && magic != NPC_MAGIC_DRV && magic != NPC_MAGIC_HELLO && magic != NPC_MAGIC_FRZ &&
@@ -4922,26 +4955,8 @@ static int npc_on_packet(SOCKET s, const char *buf, int len, const struct sockad
         return 1;
     }
     if (magic == NPC_MAGIC_HELLO) {
-        const struct sockaddr_in *a = (const struct sockaddr_in *)from;
-        if (net[0xDA4] != 1 || !a || a->sin_family != AF_INET) return 1;
-        EnterCriticalSection(&g_npc_cs);
-        for (i = 0; i < NPC_PEERS; i++) {
-            if (g_npc_peer[i].seen && g_npc_peer[i].addr.sin_addr.s_addr == a->sin_addr.s_addr &&
-                g_npc_peer[i].addr.sin_port == a->sin_port) break;
-            if (!g_npc_peer[i].seen || now - g_npc_peer[i].seen > 10000) { if (free_i < 0) free_i = i; }
-            else if (g_npc_peer[i].seen < g_npc_peer[oldest].seen) oldest = i;
-        }
-        if (i == NPC_PEERS) {
-            i = free_i >= 0 ? free_i : oldest;
-            g_npc_peer[i].addr = *a;
-            plog("[net] client %u.%u.%u.%u:%u runs the co-op proxy - sending it the NPC frame table",
-                 a->sin_addr.S_un.S_un_b.s_b1, a->sin_addr.S_un.S_un_b.s_b2, a->sin_addr.S_un.S_un_b.s_b3,
-                 a->sin_addr.S_un.S_un_b.s_b4, (WORD)((a->sin_port >> 8) | (a->sin_port << 8)));
-        }
-        g_npc_peer[i].s = s;
-        g_npc_peer[i].seen = now;
-        LeaveCriticalSection(&g_npc_cs);
-        InterlockedIncrement(&g_npc_hellos);
+        if (net[0xDA4] != 1) return 1;
+        npc_note_peer(s, from, 1);
         return 1;
     }
     if (net[0xDA4] != 0 || len < 12) return 1;
@@ -5005,7 +5020,16 @@ static void npc_on_send(SOCKET s, const struct sockaddr *to)
     now = GetTickCount();
     if (now - g_npc_hello_at < 2000) return;
     g_npc_hello_at = now;
-    o_sendto(s, (const char *)&magic, 4, 0, (const struct sockaddr *)a, sizeof(*a));
+    {
+        static int logged;
+        int r = o_sendto(s, (const char *)&magic, 4, 0, (const struct sockaddr *)a, sizeof(*a));
+        if (logged < 3) {
+            logged++;
+            plog("[net] hello to the host %u.%u.%u.%u:%u -> %d (error %d)", a->sin_addr.S_un.S_un_b.s_b1,
+                 a->sin_addr.S_un.S_un_b.s_b2, a->sin_addr.S_un.S_un_b.s_b3, a->sin_addr.S_un.S_un_b.s_b4,
+                 (WORD)((a->sin_port >> 8) | (a->sin_port << 8)), r, r < 0 ? (int)GetLastError() : 0);
+        }
+    }
 }
 
 /*
@@ -6306,6 +6330,10 @@ static int WINAPI hook_recvfrom(SOCKET s, char *buf, int len, int flags, struct 
         /* ours: hide it from the engine (its select + recvfrom loops skip a -1) */
         if (p_wsasetlasterror) p_wsasetlasterror(WSAEWOULDBLOCK);
         return -1;
+    }
+    if (r > 0 && from && g_net_npc_commands && g_mission_started) {    /* 0.82: game traffic = a client */
+        BYTE *net = kt_net();
+        if (net && net[0xDA4] == 1) npc_note_peer(s, from, 0);
     }
     return r;
 }
