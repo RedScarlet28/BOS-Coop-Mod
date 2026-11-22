@@ -44,7 +44,7 @@ python -I "$src\gen_exports.py" $original $src
 if ($LASTEXITCODE) { throw "export generation failed" }
 
 $cflags = @('/nologo', '/W3', '/O2', '/MT', '/GS', '/D_CRT_SECURE_NO_WARNINGS', '/DWIN32_LEAN_AND_MEAN')
-& cl.exe @cflags /LD "$src\bos_proxy.c" "/Fo$obj\\" "/Fe$bin\Bos.dll" /link "/DEF:$src\bos_proxy.def" "/IMPLIB:$obj\Bos.lib" user32.lib kernel32.lib
+& cl.exe @cflags /LD "$src\bos_proxy.c" "/Fo$obj\\" "/Fe$bin\Bos.dll" /link "/DEF:$src\bos_proxy.def" "/IMPLIB:$obj\Bos.lib" "/MAP:$obj\Bos.map" user32.lib kernel32.lib
 if ($LASTEXITCODE) { throw "compiling the proxy failed" }
 & cl.exe @cflags "$here\test\loadtest.c" "/Fo$obj\\" "/Fe$obj\loadtest.exe"
 if ($LASTEXITCODE) { throw "compiling the load test failed" }

@@ -31,7 +31,7 @@
 #include <ctype.h>
 #include <math.h>
 
-#define COOPMOD_VERSION "CoopMod proxy 0.80"
+#define COOPMOD_VERSION "CoopMod proxy 0.81"
 #define BOS_PREFERRED_BASE 0x10000000u
 
 static HMODULE g_self;
@@ -847,6 +847,7 @@ static BYTE __fastcall hook_load_entity(BYTE *self, void *edx, DWORD a1, DWORD a
 static int g_coop_movies = 1;            /* coop_config.ini [proxy] coop_movies */
 static char g_config_path[MAX_PATH];
 static int lua_run(const char *what, const char *code, int quiet);
+static int g_dedicated_hud_stub = 1;
 static char g_cur_level[64], g_prev_level[64];
 static char g_movies_shown[1024];        /* ";COOP_A;COOP_B;" */
 static int g_movie_due;                  /* level loaded, its movies not played yet */
@@ -2949,7 +2950,7 @@ static void mission_bootstrap(void)
     rb_strip_all("mission start");
     /* 0.54: the dedicated server has no HUD; these script calls write into it unguarded (Bos+0x133490
        MiniMapTrack, Bos+0x13AC8D ShowNewObjective) and ended most dedicated load tests at InitLevel. */
-    if (GetModuleHandleA("Dedicated_Server.exe"))
+    if (GetModuleHandleA("Dedicated_Server.exe") && g_dedicated_hud_stub)   /* 0.81: =0 tests the HUD guards */
         lua_run("dedicated: no HUD",
                 "function MiniMapTrack() end function MiniMapPing() end function ShowNewObjective() end function ShowNewSubObjective() end function ShowObjectiveDone() end", 0);
     if (g_test_lua[0]) run_lua_file("test_lua", g_test_lua);
@@ -6624,7 +6625,20 @@ static void __fastcall hook_char_damage(BYTE *self, void *edx, void *out, DWORD 
                 eng = ((fn_dmg_vp)VA(0x10093D00))();
                 if (eng) att = ((fn_dmg_ent)(*(void ***)eng)[0])(eng, NULL, &a5);   /* thiscall via fastcall */
             }
-            att_human = att ? (att == self || is_human_character(att)) : 1;
+            /* 0.81: the lookup gives the attacker's PLAYER, not its CHARACTER (0.78-0.80 read it as a character:
+               a fault every NPC hit, and when the garbage was readable a call through a garbage vtable - the host's
+               crash 2026-11-22 06:31, EIP in the heap). Only known types are trusted: a PLAYER (same vtable as the
+               victim's PLAYER) is turned into its character with Bos 0x10058D00; a CHARACTER is used as is. */
+            att_human = 1;
+            if (att) {
+                BYTE *vpl = char_player(self), *ach = NULL;
+                if (att == self) ach = self;
+                else if (*(DWORD *)att == *(DWORD *)self) ach = att;
+                else if (vpl && *(DWORD *)att == *(DWORD *)vpl)
+                    ach = ((BYTE *(__fastcall *)(BYTE *, void *))VA(0x10058D00))(att, 0);
+                if (ach && *(DWORD *)ach == *(DWORD *)self) { att = ach; att_human = ach == self || is_human_character(ach); }
+                else att = NULL;
+            }
         } __except (EXCEPTION_EXECUTE_HANDLER) { att = NULL; att_human = 1; }
         if (!att_human) {
             float before = a11;
@@ -6648,6 +6662,57 @@ static void __fastcall hook_char_damage(BYTE *self, void *edx, void *out, DWORD 
     }
     o_char_damage(self, edx, out, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
 }
+/* 0.81: the HUD's objective / minimap Lua functions look up the entity the script gives them; on the client
+   such an entity can be missing (id -1): KT_Game+0x1DE00 read garbage and the client crashed (SALTY 2026-11-22,
+   4 times on COOP_Patrol, ShowNewObjective/ShowNewSubObjective 0x1012D3F0/0x1012D430). They only draw the HUD,
+   so a fault inside them is caught and the call skipped. Each starts with a short prologue + call 0x10093CD0. */
+typedef int (__cdecl *fn_lua_c)(void *);
+#define HUD_N 5
+static fn_lua_c o_hud_fn[HUD_N];
+static const DWORD g_hud_va[HUD_N] = { 0x1012D2A0, 0x1012D360, 0x1012D3F0, 0x1012D430, 0x1012D470 };
+static const int g_hud_pre[HUD_N] = { 4, 4, 1, 1, 1 };     /* bytes before the call */
+static const char *g_hud_name[HUD_N] = { "MiniMapTrack", "MiniMapPing", "ShowNewObjective", "ShowNewSubObjective", "ShowObjectiveDone" };
+static volatile LONG g_hud_faults;
+static int hud_guard(int i, void *L)
+{
+    __try {
+        return o_hud_fn[i](L);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (InterlockedIncrement(&g_hud_faults) <= 20)
+            plog("[hud] %s faulted (exception %08X: its entity is missing on this PC) - skipped", g_hud_name[i], GetExceptionCode());
+        return 0;
+    }
+}
+static int __cdecl hud_g0(void *L) { return hud_guard(0, L); }
+static int __cdecl hud_g1(void *L) { return hud_guard(1, L); }
+static int __cdecl hud_g2(void *L) { return hud_guard(2, L); }
+static int __cdecl hud_g3(void *L) { return hud_guard(3, L); }
+static int __cdecl hud_g4(void *L) { return hud_guard(4, L); }
+static void install_hud_guards(void)
+{
+    static void *const wrap[HUD_N] = { (void *)hud_g0, (void *)hud_g1, (void *)hud_g2, (void *)hud_g3, (void *)hud_g4 };
+    int i, ok = 0;
+    for (i = 0; i < HUD_N; i++) {
+        BYTE *fn = VA(g_hud_va[i]), *t, patch[16];
+        int pre = g_hud_pre[i], n = pre + 5;
+        BYTE *call = fn + pre;
+        if (call[0] != 0xE8 || call + 5 + *(INT32 *)(call + 1) != VA(0x10093CD0)) {
+            plog("[hook] hud_guard %-20s unexpected bytes - NOT installed", g_hud_name[i]);
+            continue;
+        }
+        t = (BYTE *)VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        if (!t) continue;
+        memcpy(t, fn, pre);
+        t[pre] = 0xE8; *(INT32 *)(t + pre + 1) = (INT32)(VA(0x10093CD0) - (t + pre + 5));
+        t[n] = 0xE9; *(INT32 *)(t + n + 1) = (INT32)((fn + n) - (t + n + 5));
+        o_hud_fn[i] = (fn_lua_c)t;
+        memset(patch, 0x90, sizeof(patch));
+        patch[0] = 0xE9; *(INT32 *)(patch + 1) = (INT32)((BYTE *)wrap[i] - (fn + 5));
+        if (write_code(fn, patch, n)) ok++;
+    }
+    plog("[hook] hud_guard                  %d of %d HUD Lua functions guarded", ok, HUD_N);
+}
+
 static void install_difficulty_hook(void)
 {
     static const BYTE e[8] = { 0x83, 0xEC, 0x18, 0xF6, 0x44, 0x24, 0x34, 0x04 };   /* sub esp,18h; test byte [esp+34h],4 */
@@ -8637,6 +8702,7 @@ static void install_hooks(void)
     install_mission_failed_hook();
     install_net_hooks();
     install_difficulty_hook();
+    install_hud_guards();
 }
 
 /* coop_config.ini next to the executable; every key is optional */
@@ -8719,6 +8785,7 @@ static void load_config(void)
         if (g_champions < 1 || g_champions > 3) g_champions = 1;
     }
     g_admin_hotkeys = GetPrivateProfileIntA("proxy", "admin_hotkeys", 1, path);
+    g_dedicated_hud_stub = GetPrivateProfileIntA("proxy", "dedicated_hud_stub", 1, path);
     GetPrivateProfileStringA("proxy", "admin_test", "", g_admin_test, sizeof(g_admin_test), path);
     g_net_dump_ws = GetPrivateProfileIntA("proxy", "net_dump_ws", 1, path);
     g_net_dump_ws_max = GetPrivateProfileIntA("proxy", "net_dump_ws_max", 10, path);
