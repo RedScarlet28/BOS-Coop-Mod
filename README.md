@@ -7,6 +7,8 @@ The campaign levels run inside a multiplayer session. A proxy DLL (`Bos.dll` →
 as `Bos_core.dll`) fixes the places where the game's code assumes a single player, and keeps
 both PCs in sync.
 
+WARNING! SKIP FIRST MISSION COOP_PATROL1 IF YOU WANT, IT IS JUST A TUTORIAL MISSION AND I HAVE CUT OUT THE CUTSCENES/VOICELINES SINCE THEY WERE HOLDING THE PACING BACK ALOT!.
+
 ## Features
 
 - **The whole campaign in co-op**: 32 co-op levels (`COOP_<level>`), chained in story order.
